@@ -137,6 +137,7 @@ impl RendezvousServer {
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
         let mut socket = create_udp_listener(bind_addr, port, rmem).await?;
+        let api_db = pm.db.clone();
         let (tx, mut rx) = mpsc::unbounded_channel::<Data>();
         let software_url = get_arg("software-url");
         let version = hbb_common::get_version_from_url(&software_url);
@@ -172,7 +173,19 @@ impl RendezvousServer {
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
-        std::env::set_var("PORT_FOR_API", port.to_string());
+        let api_server = if get_arg("API_ENABLED").to_uppercase() == "Y" {
+            let api_port = get_arg_opt("API_PORT")
+                .map(|value| value.parse::<u16>())
+                .transpose()?
+                .unwrap_or(u16::try_from(port - 2)?);
+            let api_bind = get_arg_opt("API_BIND")
+                .map(|value| value.parse::<IpAddr>())
+                .transpose()?
+                .or(Some(IpAddr::from([127, 0, 0, 1])));
+            Some(crate::api::start(api_db, api_bind, api_port).await?)
+        } else {
+            None
+        };
         rs.parse_relay_servers(&get_arg("relay-servers"));
         let mut listener = create_tcp_listener(bind_addr, port).await?;
         let mut listener2 = create_tcp_listener(bind_addr, nat_port).await?;
@@ -257,9 +270,16 @@ impl RendezvousServer {
             }
         };
         let listen_signal = listen_signal();
+        let api_service = async move {
+            if let Some(server) = api_server {
+                server.await??;
+            }
+            std::future::pending::<ResultType<()>>().await
+        };
         tokio::select!(
             res = main_task => res,
             res = listen_signal => res,
+            res = api_service => res,
         )
     }
 

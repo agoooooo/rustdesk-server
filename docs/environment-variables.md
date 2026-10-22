@@ -49,11 +49,33 @@ in the inherited process environment.
 | `DB_URL` 🅴 | *(none)* | `./db_v2.sqlite3` | Path/URL of the SQLite database file. See [Database](#database). |
 | `MAX_DATABASE_CONNECTIONS` 🅴 | *(none)* | `1` | Size of the SQLite connection pool. |
 | `MAX_PUNCH_REQUESTS` 🅴 | *(none)* | `100000` | Number of punch-request records kept in memory for the `punch-requests` [console](#runtime-console) command; the oldest is dropped when full. `0` disables recording. |
+| `API_ENABLED` 🅴 | *(none)* | `N` | Set to `Y` to enable the optional open-source account API. |
+| `API_PORT` 🅴 | *(none)* | `PORT - 2` | **Open-source account API.** Defaults to port `21114` when `hbbs` uses its default port `21116`. |
+| `API_BIND` 🅴 | *(none)* | `127.0.0.1` | Local address for the account API. Keep it on loopback and put an HTTPS reverse proxy in front of it for remote clients. |
+| `ADMIN_USER` 🅴 | *(none)* | *(no initial account)* | Username for the first administrator account. Must be set together with `ADMIN_PASSWORD`. |
+| `ADMIN_PASSWORD` 🅴 | *(none)* | *(no initial account)* | Password for the first administrator account; must be 8–72 bytes. It is only used to create the account if that username does not already exist. |
 
 🅴 = set through the inherited process environment.
 
 > `PORT_FOR_API` / `KEY_FOR_API` are only used by RustDesk Server **Pro** and its
-> API; they have no effect in the open‑source server.
+> API; they have no effect in the open‑source server. The open-source account
+> API described above uses `API_PORT` and `API_BIND`.
+
+### Open-source account API
+
+Set `API_ENABLED=Y` to expose an account API on `API_BIND:API_PORT`. It supports
+RustDesk account login and current-user lookup, authenticated user listing for
+clients, and administrator-only user create/update/delete operations under
+`/api/admin/users`. The first administrator is bootstrapped from
+`ADMIN_USER` / `ADMIN_PASSWORD`; there is no public registration endpoint.
+User accounts are stored in the existing SQLite database with bcrypt password
+hashes. Access tokens expire after eight hours.
+
+The API defaults to loopback because it serves password-based login over HTTP.
+For remote use, configure an HTTPS reverse proxy and point clients to its API
+URL. Do not expose the API over untrusted networks without TLS. The initial
+account password is not reset on restart; change credentials through the
+administrator API.
 
 ---
 
