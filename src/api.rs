@@ -263,6 +263,14 @@ pub(crate) async fn start(
         )
         .route("/api/address-books", get(list_accessible_address_books))
         .route(
+            "/api/personal/address-books",
+            get(list_personal_address_books).post(create_personal_address_book),
+        )
+        .route(
+            "/api/personal/address-books/:id",
+            put(update_personal_address_book).delete(delete_personal_address_book),
+        )
+        .route(
             "/api/address-books/:id/entries",
             get(list_accessible_address_book_entries).post(create_address_book_entry),
         )
@@ -1020,6 +1028,132 @@ async fn list_accessible_address_books(
     })))
 }
 
+async fn list_personal_address_books(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<Pagination>,
+) -> Result<Json<Value>, ApiError> {
+    let user = authenticated_user(&state, &headers).await?;
+    let current = query.current.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
+    let offset = current.saturating_sub(1).saturating_mul(page_size);
+    let (books, total) = state
+        .db
+        .list_personal_address_books(user.id, page_size, offset)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list personal address books: {}", error);
+            ApiError::internal()
+        })?;
+    Ok(Json(json!({
+        "total": total,
+        "data": books,
+        "current": current,
+    })))
+}
+
+async fn create_personal_address_book(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<AddressBookRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let actor = authenticated_user(&state, &headers).await?;
+    validate_address_book(&request.name, &request.description)?;
+    let id = state
+        .db
+        .create_personal_address_book(actor.id, request.name.trim(), request.description.trim())
+        .await
+        .map_err(address_book_write_error)?;
+    record_admin_audit(
+        &state,
+        &actor,
+        "create",
+        "address_book",
+        &id.to_string(),
+        "Created personal address book",
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": id,
+            "name": request.name.trim(),
+            "description": request.description.trim(),
+            "permission": "manage",
+            "entry_count": 0,
+            "is_personal": true,
+        })),
+    ))
+}
+
+async fn update_personal_address_book(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(request): Json<AddressBookRequest>,
+) -> Result<StatusCode, ApiError> {
+    let actor = authenticated_user(&state, &headers).await?;
+    validate_address_book(&request.name, &request.description)?;
+    let updated = state
+        .db
+        .update_personal_address_book(
+            actor.id,
+            id,
+            request.name.trim(),
+            request.description.trim(),
+        )
+        .await
+        .map_err(address_book_write_error)?;
+    if !updated {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Personal address book not found",
+        ));
+    }
+    record_admin_audit(
+        &state,
+        &actor,
+        "update",
+        "address_book",
+        &id.to_string(),
+        "Updated personal address book",
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_personal_address_book(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let actor = authenticated_user(&state, &headers).await?;
+    let deleted = state
+        .db
+        .delete_personal_address_book(actor.id, id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to delete personal address book: {}", error);
+            ApiError::internal()
+        })?;
+    if !deleted {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Personal address book not found",
+        ));
+    }
+    record_admin_audit(
+        &state,
+        &actor,
+        "delete",
+        "address_book",
+        &id.to_string(),
+        "Deleted personal address book",
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_admin_address_books(
     Extension(state): Extension<ApiState>,
     headers: HeaderMap,
@@ -1287,7 +1421,7 @@ async fn list_address_book_permissions(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
-    require_address_book_access(&state, &headers, id, "manage").await?;
+    require_shared_address_book_access(&state, &headers, id).await?;
     let permissions = state
         .db
         .list_address_book_permissions(id)
@@ -1306,7 +1440,7 @@ async fn update_address_book_permissions(
     Path(id): Path<i64>,
     Json(request): Json<AddressBookPermissionsRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_address_book_access(&state, &headers, id, "manage").await?;
+    let actor = require_shared_address_book_access(&state, &headers, id).await?;
     if request.permissions.len() > 2000 {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -1400,6 +1534,24 @@ async fn require_address_book_access(
     required: &str,
 ) -> Result<User, ApiError> {
     let user = authenticated_user(state, headers).await?;
+    let owner = state
+        .db
+        .address_book_owner(book_id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to determine address book owner: {}", error);
+            ApiError::internal()
+        })?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Address book not found"))?;
+    if let Some(owner_id) = owner {
+        if owner_id == user.id {
+            return Ok(user);
+        }
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Address book access denied",
+        ));
+    }
     if user.is_admin {
         return Ok(user);
     }
@@ -1419,6 +1571,29 @@ async fn require_address_book_access(
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "Address book access denied",
+        ));
+    }
+    Ok(user)
+}
+
+async fn require_shared_address_book_access(
+    state: &ApiState,
+    headers: &HeaderMap,
+    book_id: i64,
+) -> Result<User, ApiError> {
+    let user = require_address_book_access(state, headers, book_id, "manage").await?;
+    let owner = state
+        .db
+        .address_book_owner(book_id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to determine address book owner: {}", error);
+            ApiError::internal()
+        })?;
+    if owner != Some(None) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Personal address books cannot be shared",
         ));
     }
     Ok(user)
@@ -2428,6 +2603,229 @@ mod tests {
     #[test]
     fn address_books_enforce_acl_inheritance_and_write_access() {
         address_book_api_flow();
+    }
+
+    #[test]
+    fn personal_address_books_are_owner_scoped_and_removed_with_their_owner() {
+        personal_address_book_api_flow();
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    async fn personal_address_book_api_flow() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(file.path().to_str().unwrap()).await.unwrap();
+        db.create_user(
+            "admin",
+            "Admin",
+            "admin@example.com",
+            &hash("admin-test-password", DEFAULT_COST).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        let alice_id = db
+            .create_user(
+                "alice",
+                "Alice",
+                "alice@example.com",
+                &hash("alice-test-password", DEFAULT_COST).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+        db.create_user(
+            "bob",
+            "Bob",
+            "bob@example.com",
+            &hash("bob-test-password", DEFAULT_COST).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        let state = ApiState {
+            db: db.clone(),
+            jwt_secret: "personal-address-book-test-secret".to_owned(),
+            peer_map: PeerMap::with_database(db.clone()),
+        };
+        let alice_headers = test_auth_headers(&state, "alice");
+        let bob_headers = test_auth_headers(&state, "bob");
+        let admin_headers = test_auth_headers(&state, "admin");
+
+        let (status, book) = create_personal_address_book(
+            Extension(state.clone()),
+            alice_headers.clone(),
+            Json(AddressBookRequest {
+                name: "Private".to_owned(),
+                description: "Alice devices".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(book["is_personal"], true);
+        let book_id = book["id"].as_i64().unwrap();
+        assert_eq!(
+            update_personal_address_book(
+                Extension(state.clone()),
+                alice_headers.clone(),
+                Path(book_id),
+                Json(AddressBookRequest {
+                    name: "Private updated".to_owned(),
+                    description: "Updated description".to_owned(),
+                }),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            list_personal_address_books(
+                Extension(state.clone()),
+                alice_headers.clone(),
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0["total"],
+            1
+        );
+        for headers in [bob_headers.clone(), admin_headers.clone()] {
+            assert_eq!(
+                list_personal_address_books(
+                    Extension(state.clone()),
+                    headers,
+                    Query(Pagination {
+                        current: Some(1),
+                        page_size: Some(100),
+                        status: None,
+                    }),
+                )
+                .await
+                .unwrap()
+                .0["total"],
+                0
+            );
+        }
+        assert_eq!(
+            list_accessible_address_books(
+                Extension(state.clone()),
+                admin_headers.clone(),
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0["total"],
+            0
+        );
+        let (entry_status, entry) = create_address_book_entry(
+            Extension(state.clone()),
+            alice_headers.clone(),
+            Path(book_id),
+            Json(AddressBookEntryRequest {
+                device_id: "alice-device".to_owned(),
+                alias: "Laptop".to_owned(),
+                note: String::new(),
+                tags: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(entry_status, StatusCode::CREATED);
+        for headers in [bob_headers.clone(), admin_headers.clone()] {
+            assert_eq!(
+                list_accessible_address_book_entries(
+                    Extension(state.clone()),
+                    headers,
+                    Path(book_id),
+                )
+                .await
+                .unwrap_err()
+                .status,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            list_address_book_permissions(
+                Extension(state.clone()),
+                alice_headers.clone(),
+                Path(book_id),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            update_personal_address_book(
+                Extension(state.clone()),
+                bob_headers,
+                Path(book_id),
+                Json(AddressBookRequest {
+                    name: "Stolen".to_owned(),
+                    description: String::new(),
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::NOT_FOUND
+        );
+        let entry_id = entry["id"].as_i64().unwrap();
+        assert_eq!(
+            delete_address_book_entry(
+                Extension(state.clone()),
+                alice_headers.clone(),
+                Path((book_id, entry_id)),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let (status, disposable_book) = create_personal_address_book(
+            Extension(state.clone()),
+            alice_headers.clone(),
+            Json(AddressBookRequest {
+                name: "Disposable".to_owned(),
+                description: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        let disposable_id = disposable_book["id"].as_i64().unwrap();
+        assert_eq!(
+            delete_personal_address_book(
+                Extension(state.clone()),
+                alice_headers,
+                Path(disposable_id),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            state.db.address_book_owner(disposable_id).await.unwrap(),
+            None
+        );
+
+        state.db.delete_user(alice_id).await.unwrap();
+        assert_eq!(
+            state
+                .db
+                .list_personal_address_books(alice_id, 100, 0)
+                .await
+                .unwrap()
+                .1,
+            0
+        );
     }
 
     #[tokio::main(flavor = "current_thread")]

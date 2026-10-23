@@ -85,6 +85,7 @@ pub struct AddressBook {
     pub description: String,
     pub permission: String,
     pub entry_count: i64,
+    pub is_personal: bool,
 }
 
 #[derive(Clone, Debug, Serialize, sqlx::FromRow)]
@@ -205,8 +206,9 @@ impl Database {
                 on user_group_members (user_id);
             create table if not exists address_books (
                 id integer primary key autoincrement,
-                name varchar(100) not null collate nocase unique,
+                name varchar(100) not null collate nocase,
                 description varchar(300) not null default '',
+                owner_id integer,
                 created_at datetime not null default(current_timestamp)
             );
             create table if not exists address_book_entries (
@@ -246,6 +248,54 @@ impl Database {
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
+        self.migrate_address_book_owners().await?;
+        sqlx::query(
+            "create unique index if not exists index_address_books_shared_name \
+               on address_books(name collate nocase) where owner_id is null;
+             create unique index if not exists index_address_books_personal_name \
+               on address_books(owner_id, name collate nocase) where owner_id is not null;",
+        )
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(())
+    }
+
+    async fn migrate_address_book_owners(&self) -> ResultType<()> {
+        let has_owner_column: i64 = sqlx::query_scalar(
+            "select count(*) from pragma_table_info('address_books') where name = 'owner_id'",
+        )
+        .fetch_one(self.pool.get().await?.deref_mut())
+        .await?;
+        if has_owner_column != 0 {
+            return Ok(());
+        }
+
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        sqlx::query("alter table address_books rename to address_books_legacy")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "create table address_books (
+                id integer primary key autoincrement,
+                name varchar(100) not null collate nocase,
+                description varchar(300) not null default '',
+                owner_id integer,
+                created_at datetime not null default(current_timestamp)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "insert into address_books(id, name, description, created_at) \
+             select id, name, description, created_at from address_books_legacy",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("drop table address_books_legacy")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -486,6 +536,24 @@ impl Database {
                 .execute(conn.deref_mut())
                 .await?;
         }
+        sqlx::query(
+            "delete from address_book_entries where book_id in \
+             (select id from address_books where owner_id = ?)",
+        )
+        .bind(id)
+        .execute(conn.deref_mut())
+        .await?;
+        sqlx::query(
+            "delete from address_book_permissions where book_id in \
+             (select id from address_books where owner_id = ?)",
+        )
+        .bind(id)
+        .execute(conn.deref_mut())
+        .await?;
+        sqlx::query("delete from address_books where owner_id = ?")
+            .bind(id)
+            .execute(conn.deref_mut())
+            .await?;
         sqlx::query("delete from user_group_members where user_id = ?")
             .bind(id)
             .execute(conn.deref_mut())
@@ -787,15 +855,42 @@ impl Database {
         let mut conn = self.pool.get().await?;
         let books = sqlx::query_as::<_, AddressBook>(
             "select b.id, b.name, b.description, 'manage' as permission, \
-             count(e.id) as entry_count \
+             count(e.id) as entry_count, 0 as is_personal \
              from address_books b left join address_book_entries e on e.book_id = b.id \
+             where b.owner_id is null \
              group by b.id order by b.name collate nocase limit ? offset ?",
         )
         .bind(limit)
         .bind(offset)
         .fetch_all(conn.deref_mut())
         .await?;
-        let total = sqlx::query_scalar("select count(*) from address_books")
+        let total = sqlx::query_scalar("select count(*) from address_books where owner_id is null")
+            .fetch_one(conn.deref_mut())
+            .await?;
+        Ok((books, total))
+    }
+
+    pub async fn list_personal_address_books(
+        &self,
+        owner_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<AddressBook>, i64)> {
+        let mut conn = self.pool.get().await?;
+        let books = sqlx::query_as::<_, AddressBook>(
+            "select b.id, b.name, b.description, 'manage' as permission, \
+             count(e.id) as entry_count, 1 as is_personal \
+             from address_books b left join address_book_entries e on e.book_id = b.id \
+             where b.owner_id = ? \
+             group by b.id order by b.name collate nocase limit ? offset ?",
+        )
+        .bind(owner_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        let total = sqlx::query_scalar("select count(*) from address_books where owner_id = ?")
+            .bind(owner_id)
             .fetch_one(conn.deref_mut())
             .await?;
         Ok((books, total))
@@ -812,7 +907,7 @@ impl Database {
             "select b.id, b.name, b.description, \
              case max(case ap.access when 'manage' then 3 when 'write' then 2 when 'read' then 1 else 0 end) \
                when 3 then 'manage' when 2 then 'write' else 'read' end as permission, \
-             count(distinct e.id) as entry_count \
+             count(distinct e.id) as entry_count, 0 as is_personal \
              from address_books b \
              join address_book_permissions ap on ap.book_id = b.id \
              left join user_group_members gm on ap.subject_type = 'group' \
@@ -873,11 +968,29 @@ impl Database {
     }
 
     pub async fn create_address_book(&self, name: &str, description: &str) -> ResultType<i64> {
-        let result = sqlx::query("insert into address_books(name, description) values(?, ?)")
-            .bind(name)
-            .bind(description)
-            .execute(self.pool.get().await?.deref_mut())
-            .await?;
+        let result = sqlx::query(
+            "insert into address_books(name, description, owner_id) values(?, ?, null)",
+        )
+        .bind(name)
+        .bind(description)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn create_personal_address_book(
+        &self,
+        owner_id: i64,
+        name: &str,
+        description: &str,
+    ) -> ResultType<i64> {
+        let result =
+            sqlx::query("insert into address_books(name, description, owner_id) values(?, ?, ?)")
+                .bind(name)
+                .bind(description)
+                .bind(owner_id)
+                .execute(self.pool.get().await?.deref_mut())
+                .await?;
         Ok(result.last_insert_rowid())
     }
 
@@ -894,6 +1007,57 @@ impl Database {
             .execute(self.pool.get().await?.deref_mut())
             .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn update_personal_address_book(
+        &self,
+        owner_id: i64,
+        id: i64,
+        name: &str,
+        description: &str,
+    ) -> ResultType<bool> {
+        let result = sqlx::query(
+            "update address_books set name = ?, description = ? \
+             where id = ? and owner_id = ?",
+        )
+        .bind(name)
+        .bind(description)
+        .bind(id)
+        .bind(owner_id)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delete_personal_address_book(&self, owner_id: i64, id: i64) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let result = sqlx::query("delete from address_books where id = ? and owner_id = ?")
+            .bind(id)
+            .bind(owner_id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 1 {
+            sqlx::query("delete from address_book_entries where book_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("delete from address_book_permissions where book_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn address_book_owner(&self, id: i64) -> ResultType<Option<Option<i64>>> {
+        Ok(
+            sqlx::query_scalar("select owner_id from address_books where id = ?")
+                .bind(id)
+                .fetch_optional(self.pool.get().await?.deref_mut())
+                .await?,
+        )
     }
 
     pub async fn delete_address_book(&self, id: i64) -> ResultType<bool> {
@@ -1146,7 +1310,71 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use super::{Connection, Database, SqliteConnectOptions, SqliteConnection};
     use hbb_common::tokio;
+
+    #[test]
+    fn migrates_legacy_address_books_and_allows_scoped_names() {
+        address_book_owner_migration();
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    async fn address_book_owner_migration() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(file.path())
+            .create_if_missing(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query(
+            "create table address_books (
+                id integer primary key autoincrement,
+                name varchar(100) not null collate nocase unique,
+                description varchar(300) not null default '',
+                created_at datetime not null default(current_timestamp)
+            );
+            create table address_book_entries (
+                id integer primary key autoincrement,
+                book_id integer not null,
+                device_id varchar(100) not null,
+                alias varchar(100) not null default '',
+                note varchar(300) not null default '',
+                tags text not null default '[]',
+                unique (book_id, device_id)
+            );
+            insert into address_books(name, description) values('Existing', 'legacy');
+            insert into address_book_entries(book_id, device_id, alias) \
+             values(1, 'legacy-device', 'Legacy device');",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+
+        let db = Database::new(file.path().to_str().unwrap()).await.unwrap();
+        let (shared, shared_total) = db.list_address_books(100, 0).await.unwrap();
+        assert_eq!(shared_total, 1);
+        assert_eq!(shared[0].name, "Existing");
+        assert!(!shared[0].is_personal);
+        assert_eq!(
+            db.list_address_book_entries(1).await.unwrap().unwrap()[0].device_id,
+            "legacy-device"
+        );
+
+        db.create_personal_address_book(7, "Existing", "private")
+            .await
+            .unwrap();
+        db.create_personal_address_book(8, "Existing", "another user")
+            .await
+            .unwrap();
+        assert!(db
+            .create_personal_address_book(7, "existing", "duplicate")
+            .await
+            .is_err());
+        let (personal, personal_total) = db.list_personal_address_books(7, 100, 0).await.unwrap();
+        assert_eq!(personal_total, 1);
+        assert!(personal[0].is_personal);
+    }
+
     #[test]
     fn test_insert() {
         insert();

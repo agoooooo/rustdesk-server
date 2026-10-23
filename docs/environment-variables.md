@@ -91,15 +91,18 @@ assign `read`, `write`, or `manage` permissions to users, user groups, or all
 authenticated users. Group permissions are inherited by active group members;
 the strongest matching permission applies. `write` allows entry CRUD, while
 `manage` also allows changing address-book permissions. Administrators retain
-access to every address book. These permissions only control address-book data;
-they do not grant RustDesk connection access. Personal address books and
-connection authorization are not implemented. The API does not enforce
-connection authorization based on account ownership. Ownership controls device
-inventory visibility only; it does not replace the target device's password,
-confirmation, or unattended-access settings.
+access to every shared address book. Authenticated users can create and manage
+their own personal address books and entries; personal books are private,
+cannot have sharing rules, and are removed when the owner account is deleted.
+Personal-book endpoints do not expose another user's books, including to
+administrators. Address-book permissions only control address-book data; they
+do not grant RustDesk connection access. The API does not enforce connection
+authorization based on account ownership. Ownership controls device inventory
+visibility only; it does not replace the target device's password, confirmation,
+or unattended-access settings.
 
-Successful management changes to users, devices, groups, and shared address
-books are recorded in an administrator-readable operation log. This records
+Successful management changes to users, devices, groups, and address books are
+recorded in an administrator-readable operation log. This records
 action and resource identifiers, not passwords, tokens, notes, or full request
 bodies. The log keeps the newest 100,000 entries. Connection sessions, file
 transfers, alerts, and failed requests are not included.
@@ -119,9 +122,11 @@ Relevant endpoints:
 | `/api/admin/user-groups` | Administrator | Create, list, update, and delete user groups. |
 | `/api/admin/user-groups/:id/users` | Administrator | Read or replace group membership; JSON body: `{"user_ids":[1,2]}`. Only active users can be assigned. |
 | `GET /api/address-books` | Authenticated | List address books accessible to the current account; administrators see all books. |
-| `GET /api/address-books/:id/entries` | Read permission | List device ID entries. |
-| `POST /api/address-books/:id/entries` | Write permission | Add an entry; tags are a JSON string array. |
-| `PUT`, `DELETE /api/address-books/:id/entries/:entry_id` | Write permission | Edit or remove an entry. |
+| `GET`, `POST /api/personal/address-books` | Authenticated | List the current account's personal books or create one. |
+| `PUT`, `DELETE /api/personal/address-books/:id` | Owner | Update or delete a personal book. |
+| `GET /api/address-books/:id/entries` | Read permission or personal-book owner | List device ID entries. |
+| `POST /api/address-books/:id/entries` | Write permission or personal-book owner | Add an entry; tags are a JSON string array. |
+| `PUT`, `DELETE /api/address-books/:id/entries/:entry_id` | Write permission or personal-book owner | Edit or remove an entry. |
 | `GET`, `PUT /api/address-books/:id/permissions` | Manage permission | Read or replace sharing rules; JSON body: `{"permissions":[{"subject_type":"group","subject_id":1,"access":"read"}]}`. |
 | `/api/admin/address-books` | Administrator | Create, list, update, and delete shared address books. |
 | `/api/admin/address-books/:id` | Administrator | Update or delete a shared address book. |
