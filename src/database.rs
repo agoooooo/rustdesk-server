@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use hbb_common::{log, ResultType};
+use serde::Serialize;
 use sqlx::{
     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
 };
@@ -59,6 +60,14 @@ pub struct User {
     pub is_admin: bool,
     pub status: i64,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+pub struct DeviceGroup {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub device_count: i64,
 }
 
 impl Database {
@@ -122,7 +131,20 @@ impl Database {
             create table if not exists app_config (
                 key varchar(100) primary key not null,
                 value text not null
-            );",
+            );
+            create table if not exists device_groups (
+                id integer primary key autoincrement,
+                name varchar(100) not null collate nocase unique,
+                description varchar(300) not null default '',
+                created_at datetime not null default(current_timestamp)
+            );
+            create table if not exists device_group_peers (
+                group_id integer not null,
+                peer_id varchar(100) not null,
+                primary key (group_id, peer_id)
+            );
+            create index if not exists index_device_group_peers_peer_id
+                on device_group_peers (peer_id);",
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
@@ -365,6 +387,144 @@ impl Database {
         Ok(sqlx::query_scalar("select count(*) from users where is_admin = 1 and status = 1")
             .fetch_one(self.pool.get().await?.deref_mut())
             .await?)
+    }
+
+    pub async fn list_device_groups(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<DeviceGroup>, i64)> {
+        let mut conn = self.pool.get().await?;
+        let groups = sqlx::query_as::<_, DeviceGroup>(
+            "select g.id, g.name, g.description, count(gp.peer_id) as device_count \
+             from device_groups g left join device_group_peers gp on gp.group_id = g.id \
+             group by g.id order by g.name collate nocase limit ? offset ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        let total = sqlx::query_scalar("select count(*) from device_groups")
+            .fetch_one(conn.deref_mut())
+            .await?;
+        Ok((groups, total))
+    }
+
+    pub async fn create_device_group(&self, name: &str, description: &str) -> ResultType<i64> {
+        let result = sqlx::query("insert into device_groups(name, description) values(?, ?)")
+            .bind(name)
+            .bind(description)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn update_device_group(
+        &self,
+        id: i64,
+        name: &str,
+        description: &str,
+    ) -> ResultType<bool> {
+        let result = sqlx::query("update device_groups set name = ?, description = ? where id = ?")
+            .bind(name)
+            .bind(description)
+            .bind(id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delete_device_group(&self, id: i64) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let result = sqlx::query("delete from device_groups where id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 1 {
+            sqlx::query("delete from device_group_peers where group_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn list_device_group_peers(&self, id: i64) -> ResultType<Option<Vec<String>>> {
+        let mut conn = self.pool.get().await?;
+        let exists: Option<i64> = sqlx::query_scalar("select id from device_groups where id = ?")
+            .bind(id)
+            .fetch_optional(conn.deref_mut())
+            .await?;
+        let Some(_) = exists else {
+            return Ok(None);
+        };
+        let peers = sqlx::query_scalar(
+            "select peer_id from device_group_peers where group_id = ? order by peer_id",
+        )
+        .bind(id)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        Ok(Some(peers))
+    }
+
+    pub async fn set_device_group_peers(&self, id: i64, peers: &[String]) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let exists: Option<i64> = sqlx::query_scalar("select id from device_groups where id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("delete from device_group_peers where group_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for peer_id in peers {
+            sqlx::query("insert into device_group_peers(group_id, peer_id) values(?, ?)")
+                .bind(id)
+                .bind(peer_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn list_accessible_device_groups(
+        &self,
+        owner: &str,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<DeviceGroup>, i64)> {
+        let mut conn = self.pool.get().await?;
+        let owner = owner.as_bytes();
+        let groups = sqlx::query_as::<_, DeviceGroup>(
+            "select g.id, g.name, g.description, count(gp.peer_id) as device_count \
+             from device_groups g \
+             join device_group_peers gp on gp.group_id = g.id \
+             join peer p on p.id = gp.peer_id \
+             where p.user = ? \
+             group by g.id order by g.name collate nocase limit ? offset ?",
+        )
+        .bind(owner)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        let total = sqlx::query_scalar(
+            "select count(distinct g.id) from device_groups g \
+             join device_group_peers gp on gp.group_id = g.id \
+             join peer p on p.id = gp.peer_id where p.user = ?",
+        )
+        .bind(owner)
+        .fetch_one(conn.deref_mut())
+        .await?;
+        Ok((groups, total))
     }
 
     pub async fn get_or_create_api_secret(&self) -> ResultType<String> {

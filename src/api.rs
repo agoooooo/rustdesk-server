@@ -16,6 +16,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -111,6 +112,25 @@ struct UpdateUser {
     password: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct CreateDeviceGroup {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateDeviceGroup {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateDeviceGroupPeers {
+    device_ids: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct UserPayload {
     id: i64,
@@ -161,6 +181,18 @@ pub(crate) async fn start(
         .route("/api/device-group/accessible", get(list_groups))
         .route("/api/admin/peers", get(list_admin_peers))
         .route("/api/admin/peers/:id", put(update_peer))
+        .route(
+            "/api/admin/device-groups",
+            get(list_admin_device_groups).post(create_device_group),
+        )
+        .route(
+            "/api/admin/device-groups/:id",
+            put(update_device_group).delete(delete_device_group),
+        )
+        .route(
+            "/api/admin/device-groups/:id/devices",
+            get(list_device_group_peers).put(update_device_group_peers),
+        )
         .route("/api/admin/users", get(list_admin_users).post(create_user))
         .route("/api/admin/users/:id", put(update_user).delete(delete_user))
         .layer(Extension(state))
@@ -390,9 +422,210 @@ async fn list_groups(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    authenticated_user(&state, &headers).await?;
+    let user = authenticated_user(&state, &headers).await?;
     let current = query.current.unwrap_or(1).max(1);
-    Ok(Json(json!({ "total": 0, "data": [], "current": current })))
+    let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
+    let (groups, total) = state
+        .db
+        .list_accessible_device_groups(&user.name, page_size, (current - 1) * page_size)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list accessible device groups: {}", error);
+            ApiError::internal()
+        })?;
+    Ok(Json(json!({
+        "total": total,
+        "data": groups,
+        "current": current,
+    })))
+}
+
+async fn list_admin_device_groups(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<Pagination>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let current = query.current.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
+    let (groups, total) = state
+        .db
+        .list_device_groups(page_size, (current - 1) * page_size)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list device groups: {}", error);
+            ApiError::internal()
+        })?;
+    Ok(Json(json!({
+        "total": total,
+        "data": groups,
+        "current": current,
+    })))
+}
+
+async fn create_device_group(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateDeviceGroup>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_admin(&state, &headers).await?;
+    validate_device_group(&request.name, &request.description)?;
+    let id = state
+        .db
+        .create_device_group(request.name.trim(), request.description.trim())
+        .await
+        .map_err(device_group_write_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": id,
+            "name": request.name.trim(),
+            "description": request.description.trim(),
+            "device_count": 0,
+        })),
+    ))
+}
+
+async fn update_device_group(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(request): Json<UpdateDeviceGroup>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers).await?;
+    validate_device_group(&request.name, &request.description)?;
+    let updated = state
+        .db
+        .update_device_group(id, request.name.trim(), request.description.trim())
+        .await
+        .map_err(device_group_write_error)?;
+    if !updated {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Device group not found",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_device_group(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers).await?;
+    let deleted = state.db.delete_device_group(id).await.map_err(|error| {
+        log::error!("Failed to delete device group: {}", error);
+        ApiError::internal()
+    })?;
+    if !deleted {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Device group not found",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_device_group_peers(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let peers = state
+        .db
+        .list_device_group_peers(id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list device group members: {}", error);
+            ApiError::internal()
+        })?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Device group not found"))?;
+    Ok(Json(json!({ "device_ids": peers })))
+}
+
+async fn update_device_group_peers(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(request): Json<UpdateDeviceGroupPeers>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers).await?;
+    if request.device_ids.len() > 2000 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "A device group can contain at most 2000 devices",
+        ));
+    }
+    let mut unique_ids = HashSet::with_capacity(request.device_ids.len());
+    for device_id in &request.device_ids {
+        if device_id.trim().is_empty()
+            || device_id.len() > crate::peer::MAX_PEER_ID_LEN
+            || !unique_ids.insert(device_id)
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Invalid or duplicate device ID",
+            ));
+        }
+        if state
+            .db
+            .get_peer(device_id)
+            .await
+            .map_err(|error| {
+                log::error!("Failed to validate device group member: {}", error);
+                ApiError::internal()
+            })?
+            .is_none()
+        {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "Device not found"));
+        }
+    }
+    let updated = state
+        .db
+        .set_device_group_peers(id, &request.device_ids)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to update device group members: {}", error);
+            ApiError::internal()
+        })?;
+    if !updated {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Device group not found",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_device_group(name: &str, description: &str) -> Result<(), ApiError> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 100 || name.chars().any(char::is_control) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Device group name must be 1-100 bytes and contain no control characters",
+        ));
+    }
+    if description.len() > 300 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Device group description must be 300 bytes or fewer",
+        ));
+    }
+    Ok(())
+}
+
+fn device_group_write_error(error: hbb_common::anyhow::Error) -> ApiError {
+    if let Some(sqlx::Error::Database(database_error)) = error.downcast_ref::<sqlx::Error>() {
+        if database_error.code().as_deref() == Some("2067")
+            || database_error.code().as_deref() == Some("1555")
+        {
+            return ApiError::new(StatusCode::CONFLICT, "Device group name already exists");
+        }
+    }
+    log::error!("Failed to save device group: {}", error);
+    ApiError::internal()
 }
 
 async fn list_admin_peers(
@@ -763,6 +996,229 @@ mod tests {
         assert!(validate_email("alice@@example.com").is_err());
         assert!(validate_password("long-enough-password").is_ok());
         assert!(validate_password("short").is_err());
+    }
+
+    #[test]
+    fn validates_device_group_fields() {
+        assert!(validate_device_group("Engineering", "Remote lab").is_ok());
+        assert!(validate_device_group(" ", "").is_err());
+        assert!(validate_device_group("Control\nGroup", "").is_err());
+        assert!(validate_device_group("Valid", &"x".repeat(301)).is_err());
+    }
+
+    #[test]
+    fn device_groups_are_admin_managed_and_account_scoped() {
+        device_group_api_flow();
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    async fn device_group_api_flow() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(file.path().to_str().unwrap()).await.unwrap();
+        db.create_user(
+            "admin",
+            "Admin",
+            "admin@example.com",
+            &hash("admin-test-password", DEFAULT_COST).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        db.create_user(
+            "alice",
+            "Alice",
+            "alice@example.com",
+            &hash("alice-test-password", DEFAULT_COST).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        db.create_user(
+            "bob",
+            "Bob",
+            "bob@example.com",
+            &hash("bob-test-password", DEFAULT_COST).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        db.insert_peer("alice-device", b"alice-uuid", b"key", "{}")
+            .await
+            .unwrap();
+        db.update_peer_owner("alice-device", Some("alice"), "")
+            .await
+            .unwrap();
+        let state = ApiState {
+            db: db.clone(),
+            jwt_secret: "device-group-test-secret".to_owned(),
+            peer_map: PeerMap::with_database(db),
+        };
+        let admin_headers = test_auth_headers(&state, "admin");
+        let alice_headers = test_auth_headers(&state, "alice");
+        let bob_headers = test_auth_headers(&state, "bob");
+
+        assert_eq!(
+            list_admin_device_groups(
+                Extension(state.clone()),
+                alice_headers,
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let (created_status, created) = create_device_group(
+            Extension(state.clone()),
+            admin_headers.clone(),
+            Json(CreateDeviceGroup {
+                name: "Lab".to_owned(),
+                description: "Test device group".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created_status, StatusCode::CREATED);
+        let group_id = created["id"].as_i64().unwrap();
+        assert_eq!(
+            create_device_group(
+                Extension(state.clone()),
+                admin_headers.clone(),
+                Json(CreateDeviceGroup {
+                    name: "lab".to_owned(),
+                    description: String::new(),
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            update_device_group_peers(
+                Extension(state.clone()),
+                admin_headers.clone(),
+                Path(group_id),
+                Json(UpdateDeviceGroupPeers {
+                    device_ids: vec!["alice-device".to_owned(), "missing-device".to_owned()],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            list_device_group_peers(
+                Extension(state.clone()),
+                admin_headers.clone(),
+                Path(group_id),
+            )
+            .await
+            .unwrap()
+            .0["device_ids"],
+            json!([])
+        );
+
+        update_device_group_peers(
+            Extension(state.clone()),
+            admin_headers.clone(),
+            Path(group_id),
+            Json(UpdateDeviceGroupPeers {
+                device_ids: vec!["alice-device".to_owned()],
+            }),
+        )
+        .await
+        .unwrap();
+        let listing = list_admin_device_groups(
+            Extension(state.clone()),
+            admin_headers.clone(),
+            Query(Pagination {
+                current: Some(1),
+                page_size: Some(100),
+                status: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(listing["data"][0]["device_count"], 1);
+        assert_eq!(
+            list_groups(
+                Extension(state.clone()),
+                test_auth_headers(&state, "alice"),
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0["total"],
+            1
+        );
+        assert_eq!(
+            list_groups(
+                Extension(state.clone()),
+                bob_headers,
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0["total"],
+            0
+        );
+
+        update_device_group(
+            Extension(state.clone()),
+            admin_headers.clone(),
+            Path(group_id),
+            Json(UpdateDeviceGroup {
+                name: "Research".to_owned(),
+                description: "Updated".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        delete_device_group(Extension(state.clone()), admin_headers, Path(group_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.db.list_device_group_peers(group_id).await.unwrap(),
+            None
+        );
+    }
+
+    fn test_auth_headers(state: &ApiState, username: &str) -> HeaderMap {
+        let token = encode(
+            &Header::default(),
+            &Claims {
+                sub: username.to_owned(),
+                exp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as usize
+                    + 3600,
+            },
+            &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
     }
 
     #[test]

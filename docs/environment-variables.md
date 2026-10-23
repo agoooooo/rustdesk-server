@@ -78,10 +78,13 @@ The first administrator is bootstrapped from `ADMIN_USER` /
 stored in the existing SQLite database with bcrypt password hashes. Access
 tokens expire after eight hours.
 
-The API does not yet provide live online status, device groups, or server-side
-connection authorization based on account ownership. Ownership controls device
-inventory visibility only; it does not replace the target device's password,
-confirmation, or unattended-access settings.
+Device groups can be created and managed by administrators, with devices
+assigned to groups. The authenticated accessible-group endpoint lists groups
+containing devices owned by that account; group membership does not grant
+connection access. The API does not enforce connection authorization based on
+account ownership. Ownership controls device inventory visibility only; it does
+not replace the target device's password, confirmation, or unattended-access
+settings.
 
 Relevant endpoints:
 
@@ -89,9 +92,11 @@ Relevant endpoints:
 |---|---|---|
 | `POST /api/login` | Public | Authenticate; client requests may include the device `id` and base64 `uuid` to claim that registered device. |
 | `GET /api/peers` | Authenticated | List devices owned by the account; administrators can see all registered devices. Each item includes `online`, based on hbbs registration within the last 30 seconds. |
-| `GET /api/device-group/accessible` | Authenticated | Returns an empty list until device groups are implemented. |
+| `GET /api/device-group/accessible` | Authenticated | List device groups containing devices owned by the account. |
 | `GET /api/admin/peers` | Administrator | List all registered devices, including their recent online status. |
 | `PUT /api/admin/peers/:id` | Administrator | Assign/unassign a device and edit its note; JSON body: `{"user":"alice","note":"..."}`. Use an empty `user` to unassign. |
+| `/api/admin/device-groups` | Administrator | Create, list, update, and delete device groups. |
+| `/api/admin/device-groups/:id/devices` | Administrator | Read or replace group membership; JSON body: `{"device_ids":["device-id"]}`. |
 | `/api/admin/users` | Administrator | Create, update, list, and delete accounts. |
 
 The API defaults to loopback because it serves password-based login over HTTP.
