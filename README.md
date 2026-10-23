@@ -57,3 +57,18 @@ bandwidth tuning, Docker image variables, and examples.
 ## Installation
 
 Please follow this [doc](https://rustdesk.com/docs/en/self-host/rustdesk-server-oss/)
+
+## Quick start (Linux)
+
+Run `./start.sh` from the repository to build (if needed) and start `hbbs` and
+`hbbr` in the background. The script prints the server address, client key,
+ports, and data/log locations. Use `./start.sh status` to check the services
+and `./start.sh stop` to stop them.
+
+The default listener binds to all interfaces and the script detects a local
+LAN address. A LAN address is not reachable from the public internet. For
+internet access, set `SERVER_ADDR` to a public IP or domain that resolves to
+this server, for example `SERVER_ADDR=rd.example.com ./start.sh`, and open TCP
+ports `21115-21119` plus UDP port `21116` in the firewall. If the server is
+behind a router, forward those ports to the server's LAN IP. Use
+`BIND_ADDRESS=127.0.0.1` to restrict listening to the local machine.
