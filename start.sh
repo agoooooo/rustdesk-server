@@ -84,6 +84,23 @@ process_matches() {
     [[ "$actual_exe" == "$expected_exe" || "$actual_exe" == "$expected_exe (deleted)" ]] || return 1
 }
 
+require_current_binaries() {
+    local name binary expected_exe actual_exe
+    for name in hbbs hbbr; do
+        binary="$HBBS"
+        [[ "$name" == hbbr ]] && binary="$HBBR"
+        if is_running "$name" "$binary"; then
+            expected_exe="$(readlink -f "$binary")"
+            actual_exe="$(readlink "/proc/$RUNNING_PID/exe")" || continue
+            if [[ "$actual_exe" == "$expected_exe (deleted)" ]]; then
+                printf '%s 仍在运行旧版本；请先执行 %s stop，再重新启动。\n' \
+                    "$name" "$ROOT_DIR/start.sh" >&2
+                return 1
+            fi
+        fi
+    done
+}
+
 show_config() {
     local public_key="$DATA_DIR/id_ed25519.pub"
     printf '\nRustDesk Server 配置\n'
@@ -170,8 +187,31 @@ start_one() {
 }
 
 build_binaries() {
+    local input binary
+    local needs_build=0
+    local -a source_paths=()
+    for input in \
+        "$ROOT_DIR/Cargo.toml" \
+        "$ROOT_DIR/Cargo.lock" \
+        "$ROOT_DIR/build.rs" \
+        "$ROOT_DIR/src" \
+        "$ROOT_DIR/libs/hbb_common"; do
+        [[ -e "$input" ]] && source_paths+=("$input")
+    done
     if [[ -x "$HBBS" && -x "$HBBR" ]]; then
-        return 0
+        if ((${#source_paths[@]})); then
+            for binary in "$HBBS" "$HBBR"; do
+                if find "${source_paths[@]}" -type f \
+                    \( -name '*.rs' -o -name Cargo.toml -o -name Cargo.lock -o -name build.rs \) \
+                    -newer "$binary" -print -quit | grep -q .; then
+                    needs_build=1
+                    break
+                fi
+            done
+        fi
+        if (( ! needs_build )); then
+            return 0
+        fi
     fi
     if [[ -x "$HOME/.cargo/bin/cargo" ]]; then
         export PATH="$HOME/.cargo/bin:$PATH"
@@ -203,6 +243,7 @@ case "${1:-start}" in
             exit 1
         fi
         build_binaries
+        require_current_binaries || exit 1
         relay_started=0
         if ! is_running hbbr "$HBBR"; then
             start_one hbbr "$HBBR" --bind "$BIND_ADDRESS" || exit 1

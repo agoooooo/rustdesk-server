@@ -9,6 +9,49 @@ const test = require("node:test");
 const sourceRoot = path.resolve(__dirname, "..");
 const sourceScript = path.join(sourceRoot, "start.sh");
 
+test("server script rebuilds binaries when Rust sources are newer", (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "rustdesk-server-build-"));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  const target = path.join(fixture, "target", "debug");
+  const source = path.join(fixture, "src");
+  const bin = path.join(fixture, "bin");
+  fs.mkdirSync(target, { recursive: true });
+  fs.mkdirSync(source);
+  fs.mkdirSync(bin);
+  const script = path.join(fixture, "start.sh");
+  fs.copyFileSync(sourceScript, script);
+  fs.chmodSync(script, 0o755);
+  for (const name of ["hbbs", "hbbr"]) {
+    const binary = path.join(target, name);
+    fs.copyFileSync("/bin/true", binary);
+    fs.chmodSync(binary, 0o755);
+    fs.utimesSync(binary, 1, 1);
+  }
+  fs.writeFileSync(path.join(source, "api.rs"), "fn main() {}");
+
+  const cargoLog = path.join(fixture, "cargo.log");
+  fs.writeFileSync(
+    path.join(bin, "cargo"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" > '${cargoLog}'\nexit 1\n`,
+  );
+  fs.writeFileSync(path.join(bin, "rustup"), "#!/bin/sh\nexit 1\n");
+  fs.chmodSync(path.join(bin, "cargo"), 0o755);
+  fs.chmodSync(path.join(bin, "rustup"), 0o755);
+  const result = spawnSync("bash", [script, "start"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      DATA_DIR: path.join(fixture, "data"),
+      HOME: path.join(fixture, "home"),
+      PATH: `${bin}:${process.env.PATH}`,
+      SERVER_ADDR: "192.0.2.1",
+    },
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.equal(fs.readFileSync(cargoLog, "utf8").trim(), "build --bins");
+});
+
 test("server script recovers missing PID files and stops daemons with deleted binaries", async (t) => {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "rustdesk-server-start-"));
   const target = path.join(fixture, "target", "debug");
@@ -76,6 +119,18 @@ test("server script recovers missing PID files and stops daemons with deleted bi
       String(daemons[index].pid),
     );
   }
+
+  for (const name of ["hbbs", "hbbr"]) {
+    const binary = path.join(target, name);
+    fs.copyFileSync("/bin/sleep", binary);
+    fs.chmodSync(binary, 0o755);
+  }
+  const staleStart = spawnSync("bash", [script, "start"], {
+    encoding: "utf8",
+    env,
+  });
+  assert.notEqual(staleStart.status, 0);
+  assert.match(staleStart.stderr, /仍在运行旧版本/);
 
   const stopped = spawnSync("bash", [script, "stop"], {
     encoding: "utf8",
