@@ -140,6 +140,7 @@ Relevant endpoints:
 | Endpoint | Access | Purpose |
 |---|---|---|
 | `POST /api/login` | Public | Authenticate; client requests may include the device `id` and base64 `uuid` to claim that registered device. |
+| `POST /api/register` | Public | Create a regular account from `{"name":"alice","email":"alice@example.com","password":"..."}`; email ownership is not verified. |
 | `GET /api/peers` | Authenticated | List devices owned by the account; administrators can see all registered devices. Each item includes `online`, based on hbbs registration within the last 30 seconds. |
 | `GET /api/device-group/accessible` | Authenticated | List device groups containing devices owned by the account. |
 | `GET /api/admin/peers` | Administrator | List all registered devices, including their recent online status. |
@@ -171,6 +172,10 @@ Relevant endpoints:
 | `GET /api/admin/api-tokens` | Administrator session | List the current administrator's token metadata; secret values are never returned. |
 | `POST /api/admin/api-tokens` | Administrator session | Create a scoped token; body: `{"name":"automation","scopes":["users:read"],"expiresInDays":90}`. The response contains the secret once. |
 | `DELETE /api/admin/api-tokens/:id` | Token owner administrator session | Revoke the current administrator's token immediately. |
+
+Self-registration is unauthenticated, creates regular accounts only, and does
+not verify email ownership. Apply rate limiting at the reverse proxy before
+exposing the API to untrusted networks.
 
 Scoped API tokens can access the existing authenticated and administrator
 endpoints for their selected resource scopes. They cannot access login/session

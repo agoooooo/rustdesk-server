@@ -88,6 +88,13 @@ struct LoginRequest {
 }
 
 #[derive(Deserialize)]
+struct RegisterUserRequest {
+    name: String,
+    email: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
 struct Pagination {
     current: Option<i64>,
     #[serde(rename = "pageSize")]
@@ -272,6 +279,7 @@ pub(crate) async fn start(
     };
     let app = Router::new()
         .route("/api/login", post(login))
+        .route("/api/register", post(register_user))
         .route("/api/login-options", get(login_options))
         .route("/api/currentUser", post(current_user))
         .route("/api/logout", post(logout))
@@ -514,6 +522,34 @@ async fn login(
 
 async fn login_options() -> Json<Vec<String>> {
     Json(Vec::new())
+}
+
+async fn register_user(
+    Extension(state): Extension<ApiState>,
+    Json(request): Json<RegisterUserRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    validate_name(&request.name)?;
+    validate_email(&request.email)?;
+    validate_password(&request.password)?;
+    let password_hash = hash(request.password, DEFAULT_COST).map_err(|error| {
+        log::error!("Failed to hash self-registered user password: {}", error);
+        ApiError::internal()
+    })?;
+    state
+        .db
+        .create_user(
+            request.name.trim(),
+            "",
+            request.email.trim(),
+            &password_hash,
+            false,
+        )
+        .await
+        .map_err(database_write_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "message": "Account created" })),
+    ))
 }
 
 async fn current_user(
@@ -3103,6 +3139,85 @@ mod tests {
         assert!(validate_email("alice@@example.com").is_err());
         assert!(validate_password("long-enough-password").is_ok());
         assert!(validate_password("short").is_err());
+    }
+
+    #[test]
+    fn public_registration_creates_login_ready_non_admin_accounts() {
+        public_registration_flow();
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    async fn public_registration_flow() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(file.path().to_str().unwrap()).await.unwrap();
+        let state = ApiState {
+            db: db.clone(),
+            jwt_secret: "registration-test-secret".to_owned(),
+            peer_map: PeerMap::with_database(db.clone()),
+            started_at: Instant::now(),
+            api_address: "127.0.0.1:21114".parse().unwrap(),
+            rendezvous_address: "127.0.0.1:21116".parse().unwrap(),
+            relay_servers: Vec::new(),
+        };
+
+        let registration = serde_json::from_value(json!({
+            "name": "new-user",
+            "email": "new-user@example.com",
+            "password": "a-long-registration-password",
+            "is_admin": true,
+        }))
+        .unwrap();
+        let (status, response) = register_user(Extension(state.clone()), Json(registration))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(response["message"], "Account created");
+
+        let user = db.get_user_by_name("new-user").await.unwrap().unwrap();
+        assert!(!user.is_admin);
+        assert!(verify("a-long-registration-password", &user.password_hash).unwrap());
+
+        let login_response = login(
+            Extension(state.clone()),
+            Json(LoginRequest {
+                username: "new-user".to_owned(),
+                password: "a-long-registration-password".to_owned(),
+                id: String::new(),
+                uuid: String::new(),
+                device_info: Value::Null,
+                auto_login: false,
+                r#type: "account".to_owned(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(login_response["user"]["name"], "new-user");
+        assert_eq!(login_response["user"]["is_admin"], false);
+
+        let duplicate = register_user(
+            Extension(state.clone()),
+            Json(RegisterUserRequest {
+                name: "new-user".to_owned(),
+                email: "another@example.com".to_owned(),
+                password: "a-long-registration-password".to_owned(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(duplicate.status, StatusCode::CONFLICT);
+
+        let invalid = register_user(
+            Extension(state),
+            Json(RegisterUserRequest {
+                name: "bad".to_owned(),
+                email: "not-an-email".to_owned(),
+                password: "short".to_owned(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
