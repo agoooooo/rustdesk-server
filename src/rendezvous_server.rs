@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    tcp::{DynTcpStream, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, secretbox, sign};
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -48,7 +48,10 @@ enum Data {
 }
 
 pub(crate) const REG_TIMEOUT: i64 = 30_000;
-type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
+struct TcpStreamSink {
+    sink: SplitSink<Framed<DynTcpStream, BytesCodec>, Bytes>,
+    encrypt: Option<Encrypt>,
+}
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
     TcpStream(TcpStreamSink),
@@ -59,7 +62,50 @@ type Receiver = mpsc::UnboundedReceiver<Data>;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
+const TCP_KEY_EXCHANGE_TIMEOUT: u64 = 5_000;
+const TCP_KEY_EXCHANGE_PROBE_TIMEOUT: u64 = 500;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+
+async fn negotiate_tcp_key(
+    stream: &mut FramedStream,
+    signing_key: &sign::SecretKey,
+) -> ResultType<secretbox::Key> {
+    let (mut server_pk, server_sk) = box_::gen_keypair();
+    // Version 0 does not use signed parameters; keep this marker bit clear.
+    server_pk.0[31] &= 0x7f;
+    let mut request = RendezvousMessage::new();
+    request.set_key_exchange(KeyExchange {
+        keys: vec![sign::sign(&server_pk.0, signing_key).into()],
+        ..Default::default()
+    });
+    timeout(TCP_KEY_EXCHANGE_TIMEOUT, stream.send(&request)).await??;
+
+    let Some(bytes) = timeout(TCP_KEY_EXCHANGE_TIMEOUT, stream.next()).await? else {
+        bail!("client closed during TCP key exchange");
+    };
+    let bytes = bytes?;
+    let response = RendezvousMessage::parse_from_bytes(&bytes)?;
+    let Some(rendezvous_message::Union::KeyExchange(response)) = response.union else {
+        bail!("invalid TCP key exchange response");
+    };
+    if response.keys.len() != 2 {
+        bail!("unsupported TCP key exchange response");
+    }
+
+    Encrypt::decode(&response.keys[1], &response.keys[0], &server_sk)
+}
+
+async fn prepare_tcp_encryption(
+    stream: &mut FramedStream,
+    signing_key: &sign::SecretKey,
+) -> ResultType<(Option<secretbox::Key>, Option<BytesMut>)> {
+    match timeout(TCP_KEY_EXCHANGE_PROBE_TIMEOUT, stream.next()).await {
+        Ok(Some(Ok(bytes))) => Ok((None, Some(bytes))),
+        Ok(Some(Err(err))) => Err(err.into()),
+        Ok(None) => Ok((None, None)),
+        Err(_) => Ok((Some(negotiate_tcp_key(stream, signing_key).await?), None)),
+    }
+}
 
 // Store punch hole requests
 use once_cell::sync::Lazy;
@@ -96,6 +142,7 @@ struct Inner {
     mask: Option<Ipv4Network>,
     local_ip: String,
     sk: Option<sign::SecretKey>,
+    tcp_key_exchange: bool,
 }
 
 #[derive(Clone)]
@@ -131,6 +178,10 @@ impl RendezvousServer {
         rmem: usize,
     ) -> ResultType<()> {
         let (key, sk) = Self::get_server_sk(key)?;
+        let tcp_key_exchange = get_arg("TCP_KEY_EXCHANGE").eq_ignore_ascii_case("Y");
+        if tcp_key_exchange && sk.is_none() {
+            bail!("TCP_KEY_EXCHANGE=Y requires an hbbs signing key");
+        }
         let nat_port = port - 1;
         let ws_port = port + 2;
         let pm = PeerMap::new().await?;
@@ -169,6 +220,7 @@ impl RendezvousServer {
                 sk,
                 mask,
                 local_ip,
+                tcp_key_exchange,
             }),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -217,6 +269,10 @@ impl RendezvousServer {
             } else {
                 "N"
             }
+        );
+        log::info!(
+            "TCP_KEY_EXCHANGE={}",
+            if tcp_key_exchange { "Y" } else { "N" }
         );
         if test_addr.to_lowercase() != "no" {
             let test_addr = if test_addr.is_empty() {
@@ -784,7 +840,7 @@ impl RendezvousServer {
                 });
                 return Ok((msg_out, None));
             }
-            
+
             // record punch hole request (from addr -> peer id/peer_addr)
             record_punch_req(
                 try_into_v4(addr).ip().to_string(),
@@ -893,7 +949,12 @@ impl RendezvousServer {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
                     Sink::TcpStream(s) => {
-                        allow_err!(s.send(Bytes::from(bytes)).await);
+                        let bytes = if let Some(encrypt) = s.encrypt.as_mut() {
+                            Bytes::from(encrypt.enc(&bytes))
+                        } else {
+                            Bytes::from(bytes)
+                        };
+                        allow_err!(s.sink.send(bytes).await);
                     }
                     Sink::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
@@ -1255,9 +1316,34 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            let mut stream = FramedStream::from(stream, addr);
+            let (tcp_key, first_message) = if self.inner.tcp_key_exchange {
+                let Some(signing_key) = self.inner.sk.as_ref() else {
+                    bail!("TCP key exchange requires an hbbs signing key");
+                };
+                prepare_tcp_encryption(&mut stream, signing_key).await?
+            } else {
+                (None, None)
+            };
+            let writer_encrypt = tcp_key.as_ref().map(|key| Encrypt::new(key.clone()));
+            let mut reader_encrypt = tcp_key.map(Encrypt::new);
+            let (a, mut b) = stream.0.split();
+            sink = Some(Sink::TcpStream(TcpStreamSink {
+                sink: a,
+                encrypt: writer_encrypt,
+            }));
+            if let Some(bytes) = first_message {
+                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    return Ok(());
+                }
+            }
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(encrypt) = reader_encrypt.as_mut() {
+                    if let Err(err) = encrypt.dec(&mut bytes) {
+                        log::debug!("TCP rendezvous decryption failed from {:?}: {}", addr, err);
+                        break;
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
@@ -1451,6 +1537,120 @@ async fn create_tcp_listener(bind_addr: Option<IpAddr>, port: i32) -> ResultType
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sodiumoxide::crypto::secretbox;
+
+    #[hbb_common::tokio::test]
+    async fn tcp_key_exchange_secures_rendezvous_traffic() {
+        let (server_pk, server_sk) = sign::gen_keypair();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, addr) = listener.accept().await.unwrap();
+            let mut stream = FramedStream::from(socket, addr);
+            let (key, first_message) =
+                prepare_tcp_encryption(&mut stream, &server_sk).await.unwrap();
+            assert!(first_message.is_none());
+            let key = key.unwrap();
+            let mut reader_encrypt = Encrypt::new(key.clone());
+            let mut writer_encrypt = Encrypt::new(key);
+            let (mut writer, mut reader) = stream.0.split();
+
+            let mut bytes = timeout(3_000, reader.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            reader_encrypt.dec(&mut bytes).unwrap();
+            let request = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
+            assert!(matches!(
+                request.union,
+                Some(rendezvous_message::Union::TestNatRequest(_))
+            ));
+            let mut response = RendezvousMessage::new();
+            response.set_test_nat_response(TestNatResponse {
+                port: 1234,
+                ..Default::default()
+            });
+            let encrypted = writer_encrypt.enc(&response.write_to_bytes().unwrap());
+            writer.send(Bytes::from(encrypted)).await.unwrap();
+        });
+
+        let mut client = FramedStream::new(addr, None, 3_000).await.unwrap();
+        let bytes = client.next_timeout(3_000).await.unwrap().unwrap();
+        let request = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
+        let Some(rendezvous_message::Union::KeyExchange(exchange)) = request.union else {
+            panic!("expected the server key exchange");
+        };
+        assert_eq!(exchange.keys.len(), 1);
+
+        let signed_pk = sign::verify(&exchange.keys[0], &server_pk).unwrap();
+        let server_eph_pk: [u8; box_::PUBLICKEYBYTES] = signed_pk.try_into().unwrap();
+        let (client_pk, client_sk) = box_::gen_keypair();
+        let key = secretbox::gen_key();
+        let sealed_key = box_::seal(
+            &key.0,
+            &box_::Nonce([0; box_::NONCEBYTES]),
+            &box_::PublicKey(server_eph_pk),
+            &client_sk,
+        );
+        let mut response = RendezvousMessage::new();
+        response.set_key_exchange(KeyExchange {
+            keys: vec![client_pk.0.to_vec().into(), sealed_key.into()],
+            ..Default::default()
+        });
+        client.send(&response).await.unwrap();
+        client.set_key(key);
+
+        let mut request = RendezvousMessage::new();
+        request.set_test_nat_request(TestNatRequest::new());
+        client.send(&request).await.unwrap();
+
+        let bytes = client.next_timeout(3_000).await.unwrap().unwrap();
+        let response = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
+        let Some(rendezvous_message::Union::TestNatResponse(response)) = response.union else {
+            panic!("expected the encrypted rendezvous response");
+        };
+        assert_eq!(response.port, 1234);
+        server.await.unwrap();
+    }
+
+    #[hbb_common::tokio::test]
+    async fn tcp_key_exchange_preserves_legacy_first_message() {
+        let (_, server_sk) = sign::gen_keypair();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, addr) = listener.accept().await.unwrap();
+            let mut stream = FramedStream::from(socket, addr);
+            let (key, first_message) =
+                prepare_tcp_encryption(&mut stream, &server_sk).await.unwrap();
+            assert!(key.is_none());
+            let bytes = first_message.expect("expected the legacy request");
+            let request = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
+            assert!(matches!(
+                request.union,
+                Some(rendezvous_message::Union::TestNatRequest(_))
+            ));
+            let mut response = RendezvousMessage::new();
+            response.set_test_nat_response(TestNatResponse {
+                port: 1234,
+                ..Default::default()
+            });
+            stream.send(&response).await.unwrap();
+        });
+
+        let mut client = FramedStream::new(addr, None, 3_000).await.unwrap();
+        let mut request = RendezvousMessage::new();
+        request.set_test_nat_request(TestNatRequest::new());
+        client.send(&request).await.unwrap();
+        let bytes = client.next_timeout(3_000).await.unwrap().unwrap();
+        let response = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
+        assert!(matches!(
+            response.union,
+            Some(rendezvous_message::Union::TestNatResponse(_))
+        ));
+        server.await.unwrap();
+    }
 
     #[hbb_common::tokio::test]
     async fn udp_listener_uses_bind_address() {
