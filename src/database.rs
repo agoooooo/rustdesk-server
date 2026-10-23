@@ -35,7 +35,7 @@ pub struct Database {
     pool: Pool,
 }
 
-#[derive(Default)]
+#[derive(Default, sqlx::FromRow)]
 pub struct Peer {
     pub guid: Vec<u8>,
     pub id: String,
@@ -44,6 +44,7 @@ pub struct Peer {
     pub user: Option<Vec<u8>>,
     pub info: String,
     pub status: Option<i64>,
+    pub note: String,
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -131,11 +132,79 @@ impl Database {
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
         Ok(sqlx::query_as!(
             Peer,
-            "select guid, id, uuid, pk, user, status, info from peer where id = ?",
+            "select guid, id, uuid, pk, user, status, info, coalesce(note, '') as \"note!\" from peer where id = ?",
             id
         )
         .fetch_optional(self.pool.get().await?.deref_mut())
         .await?)
+    }
+
+    pub async fn list_peers(
+        &self,
+        owner: Option<&str>,
+        status: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<Peer>, i64)> {
+        let owner = owner.map(str::as_bytes);
+        let mut conn = self.pool.get().await?;
+        let peers = sqlx::query_as::<_, Peer>(
+            "select guid, id, uuid, pk, user, status, info, coalesce(note, '') as note \
+             from peer \
+             where (? is null or user = ?) \
+               and (? is null or coalesce(status, 1) = ?) \
+             order by id limit ? offset ?",
+        )
+        .bind(owner)
+        .bind(owner)
+        .bind(status)
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        let total = sqlx::query_scalar::<_, i64>(
+            "select count(*) from peer \
+             where (? is null or user = ?) \
+               and (? is null or coalesce(status, 1) = ?)",
+        )
+        .bind(owner)
+        .bind(owner)
+        .bind(status)
+        .bind(status)
+        .fetch_one(conn.deref_mut())
+        .await?;
+        Ok((peers, total))
+    }
+
+    pub async fn claim_peer(&self, id: &str, uuid: &[u8], owner: &str) -> ResultType<bool> {
+        let owner = owner.as_bytes();
+        let result = sqlx::query(
+            "update peer set user = ? \
+             where id = ? and uuid = ? and (user is null or user = ?)",
+        )
+        .bind(owner)
+        .bind(id)
+        .bind(uuid)
+        .bind(owner)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn update_peer_owner(
+        &self,
+        id: &str,
+        owner: Option<&str>,
+        note: &str,
+    ) -> ResultType<bool> {
+        let result = sqlx::query("update peer set user = ?, note = ? where id = ?")
+            .bind(owner.map(str::as_bytes))
+            .bind(note)
+            .bind(id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn insert_peer(
@@ -274,9 +343,20 @@ impl Database {
     }
 
     pub async fn delete_user(&self, id: i64) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
+        let name: Option<String> = sqlx::query_scalar("select name from users where id = ?")
+            .bind(id)
+            .fetch_optional(conn.deref_mut())
+            .await?;
+        if let Some(name) = name {
+            sqlx::query("update peer set user = null where user = ?")
+                .bind(name.as_bytes())
+                .execute(conn.deref_mut())
+                .await?;
+        }
         sqlx::query("delete from users where id = ?")
             .bind(id)
-            .execute(self.pool.get().await?.deref_mut())
+            .execute(conn.deref_mut())
             .await?;
         Ok(())
     }

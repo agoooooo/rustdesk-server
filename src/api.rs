@@ -152,6 +152,8 @@ pub async fn start(
         .route("/api/users", get(list_users))
         .route("/api/peers", get(list_peers))
         .route("/api/device-group/accessible", get(list_groups))
+        .route("/api/admin/peers", get(list_admin_peers))
+        .route("/api/admin/peers/:id", put(update_peer))
         .route("/api/admin/users", get(list_admin_users).post(create_user))
         .route("/api/admin/users/:id", put(update_user).delete(delete_user))
         .layer(Extension(state))
@@ -224,6 +226,38 @@ async fn login(
             StatusCode::UNAUTHORIZED,
             "Invalid username or password",
         ));
+    }
+    if !request.id.is_empty() && !request.uuid.is_empty() {
+        if request.id.trim() != request.id
+            || request.id.len() > crate::peer::MAX_PEER_ID_LEN
+            || request.uuid.len() > 512
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Invalid device identity",
+            ));
+        }
+        let uuid = base64::decode(&request.uuid)
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid device identity"))?;
+        let claimed = state
+            .db
+            .claim_peer(&request.id, &uuid, &user.name)
+            .await
+            .map_err(|error| {
+                log::error!("Failed to claim login device: {}", error);
+                ApiError::internal()
+            })?;
+        if !claimed {
+            let peer = state.db.get_peer(&request.id).await.map_err(|error| {
+                log::error!("Failed to verify login device: {}", error);
+                ApiError::internal()
+            })?;
+            let message = match peer {
+                Some(peer) if peer.uuid == uuid => "Device belongs to another account",
+                _ => "Device identity is not registered on this server",
+            };
+            return Err(ApiError::new(StatusCode::FORBIDDEN, message));
+        }
     }
     let expires_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -332,25 +366,127 @@ async fn users_response(
 async fn list_peers(
     Extension(state): Extension<ApiState>,
     headers: HeaderMap,
-    Query(_query): Query<Pagination>,
+    Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    authenticated_user(&state, &headers).await?;
-    Err(ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "Device ownership and inventory APIs are not implemented yet",
-    ))
+    let user = authenticated_user(&state, &headers).await?;
+    peers_response(&state.db, query, (!user.is_admin).then_some(user.name)).await
 }
 
 async fn list_groups(
     Extension(state): Extension<ApiState>,
     headers: HeaderMap,
-    Query(_query): Query<Pagination>,
+    Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
     authenticated_user(&state, &headers).await?;
-    Err(ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "Device groups are not implemented yet",
-    ))
+    let current = query.current.unwrap_or(1).max(1);
+    Ok(Json(json!({ "total": 0, "data": [], "current": current })))
+}
+
+async fn list_admin_peers(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<Pagination>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    peers_response(&state.db, query, None).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdatePeer {
+    #[serde(default)]
+    user: String,
+    #[serde(default)]
+    note: String,
+}
+
+async fn update_peer(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<UpdatePeer>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers).await?;
+    if id.trim().is_empty() || id.len() > crate::peer::MAX_PEER_ID_LEN {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Invalid device ID"));
+    }
+    if request.note.len() > 300 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Device note must be 300 bytes or fewer",
+        ));
+    }
+    let owner = request.user.trim();
+    let owner = if owner.is_empty() {
+        None
+    } else {
+        let user = state
+            .db
+            .get_user_by_name(owner)
+            .await
+            .map_err(|error| {
+                log::error!("Failed to query device owner: {}", error);
+                ApiError::internal()
+            })?
+            .filter(|user| user.status == 1)
+            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Active user not found"))?;
+        Some(user.name)
+    };
+    let updated = state
+        .db
+        .update_peer_owner(&id, owner.as_deref(), request.note.trim())
+        .await
+        .map_err(|error| {
+            log::error!("Failed to update device owner: {}", error);
+            ApiError::internal()
+        })?;
+    if !updated {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Device not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn peers_response(
+    db: &Database,
+    query: Pagination,
+    owner: Option<String>,
+) -> Result<Json<Value>, ApiError> {
+    let current = query.current.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
+    let (peers, total) = db
+        .list_peers(
+            owner.as_deref(),
+            query.status,
+            page_size,
+            (current - 1) * page_size,
+        )
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list devices: {}", error);
+            ApiError::internal()
+        })?;
+    let data = peers
+        .into_iter()
+        .map(|peer| {
+            let user = peer
+                .user
+                .as_deref()
+                .map(String::from_utf8_lossy)
+                .unwrap_or_default()
+                .into_owned();
+            let info = serde_json::from_str::<Value>(&peer.info).unwrap_or_else(|_| json!({}));
+            json!({
+                "id": peer.id,
+                "info": info,
+                "status": peer.status.unwrap_or(1),
+                "user": user,
+                "user_name": user,
+                "device_group_name": "",
+                "note": peer.note,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "total": total, "data": data })))
 }
 
 async fn create_user(
@@ -644,12 +780,16 @@ mod tests {
         let db = Database::new(file.path().to_str().unwrap()).await.unwrap();
         let secret = db.get_or_create_api_secret().await.unwrap();
         assert_eq!(secret, db.get_or_create_api_secret().await.unwrap());
+        let device_uuid = b"test-device-uuid";
+        db.insert_peer("test-device", device_uuid, b"device-key", "{}")
+            .await
+            .unwrap();
         let password_hash = hash("a-long-test-password", DEFAULT_COST).unwrap();
         db.create_user("alice", "Alice", "alice@example.com", &password_hash, false)
             .await
             .unwrap();
         let state = ApiState {
-            db,
+            db: db.clone(),
             jwt_secret: "test-secret".to_owned(),
         };
         let response = login(
@@ -658,7 +798,7 @@ mod tests {
                 username: "alice".to_owned(),
                 password: "a-long-test-password".to_owned(),
                 id: "test-device".to_owned(),
-                uuid: "test-uuid".to_owned(),
+                uuid: base64::encode(device_uuid),
                 device_info: Value::Null,
                 auto_login: true,
                 r#type: "account".to_owned(),
@@ -672,6 +812,10 @@ mod tests {
         assert!(response["user"]["id"].is_number());
         assert_eq!(response["user"]["name"], "alice");
         assert!(response["user"].get("password_hash").is_none());
+        assert_eq!(
+            db.get_peer("test-device").await.unwrap().unwrap().user,
+            Some(b"alice".to_vec())
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -683,6 +827,121 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(current.name, "alice");
+        let peers = list_peers(
+            Extension(state.clone()),
+            headers.clone(),
+            Query(Pagination {
+                current: Some(1),
+                page_size: Some(100),
+                status: Some(1),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(peers["total"], 1);
+        assert_eq!(peers["data"][0]["id"], "test-device");
+        assert_eq!(peers["data"][0]["user"], "alice");
+        assert_eq!(
+            list_groups(
+                Extension(state.clone()),
+                headers.clone(),
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0["total"],
+            0
+        );
+        assert_eq!(
+            list_admin_peers(
+                Extension(state.clone()),
+                headers.clone(),
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            update_peer(
+                Extension(state.clone()),
+                headers.clone(),
+                Path("test-device".to_owned()),
+                Json(UpdatePeer {
+                    user: String::new(),
+                    note: String::new(),
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let bob_password_hash = hash("another-long-test-password", DEFAULT_COST).unwrap();
+        state
+            .db
+            .create_user("bob", "Bob", "bob@example.com", &bob_password_hash, false)
+            .await
+            .unwrap();
+        let bob_token = encode(
+            &Header::default(),
+            &Claims {
+                sub: "bob".to_owned(),
+                exp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as usize
+                    + 3600,
+            },
+            &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        )
+        .unwrap();
+        let mut bob_headers = HeaderMap::new();
+        bob_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {bob_token}").parse().unwrap(),
+        );
+        let bob_peers = list_peers(
+            Extension(state.clone()),
+            bob_headers,
+            Query(Pagination {
+                current: Some(1),
+                page_size: Some(100),
+                status: Some(1),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(bob_peers["total"], 0);
+
+        let denied = login(
+            Extension(state.clone()),
+            Json(LoginRequest {
+                username: "bob".to_owned(),
+                password: "another-long-test-password".to_owned(),
+                id: "test-device".to_owned(),
+                uuid: base64::encode(device_uuid),
+                device_info: Value::Null,
+                auto_login: true,
+                r#type: "account".to_owned(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+
         let error = list_admin_users(
             Extension(state),
             headers,
@@ -714,6 +973,9 @@ mod tests {
             db: db.clone(),
             jwt_secret: "test-secret".to_owned(),
         };
+        db.insert_peer("admin-device", b"device-uuid", b"device-key", "{}")
+            .await
+            .unwrap();
         let expires_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -749,6 +1011,36 @@ mod tests {
         .unwrap();
         assert_eq!(status, StatusCode::CREATED);
 
+        assert_eq!(
+            update_peer(
+                Extension(state.clone()),
+                headers.clone(),
+                Path("admin-device".to_owned()),
+                Json(UpdatePeer {
+                    user: "alice".to_owned(),
+                    note: "Office workstation".to_owned(),
+                }),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let listed = list_admin_peers(
+            Extension(state.clone()),
+            headers.clone(),
+            Query(Pagination {
+                current: Some(1),
+                page_size: Some(100),
+                status: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["data"][0]["user"], "alice");
+        assert_eq!(listed["data"][0]["note"], "Office workstation");
+
         let updated = update_user(
             Extension(state.clone()),
             headers.clone(),
@@ -774,5 +1066,13 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         assert!(db.get_user_by_id(created.id).await.unwrap().is_none());
+        assert_eq!(
+            db.get_peer("admin-device")
+                .await
+                .unwrap()
+                .unwrap()
+                .user,
+            None
+        );
     }
 }

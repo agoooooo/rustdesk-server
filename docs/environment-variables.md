@@ -64,12 +64,32 @@ in the inherited process environment.
 ### Open-source account API
 
 Set `API_ENABLED=Y` to expose an account API on `API_BIND:API_PORT`. It supports
-RustDesk account login and current-user lookup, authenticated user listing for
-clients, and administrator-only user create/update/delete operations under
-`/api/admin/users`. The first administrator is bootstrapped from
-`ADMIN_USER` / `ADMIN_PASSWORD`; there is no public registration endpoint.
-User accounts are stored in the existing SQLite database with bcrypt password
-hashes. Access tokens expire after eight hours.
+RustDesk account login and current-user lookup, authenticated user and
+account-owned device listing for clients, and administrator-only user and device
+management under `/api/admin`. A client login binds its registered device to
+the account only when the supplied device ID and base64 UUID match the existing
+server registration; an already-owned device cannot be claimed by another
+account. Administrators can assign, unassign, and annotate registered devices.
+The first administrator is bootstrapped from `ADMIN_USER` /
+`ADMIN_PASSWORD`; there is no public registration endpoint. User accounts are
+stored in the existing SQLite database with bcrypt password hashes. Access
+tokens expire after eight hours.
+
+The API does not yet provide live online status, device groups, or server-side
+connection authorization based on account ownership. Ownership controls device
+inventory visibility only; it does not replace the target device's password,
+confirmation, or unattended-access settings.
+
+Relevant endpoints:
+
+| Endpoint | Access | Purpose |
+|---|---|---|
+| `POST /api/login` | Public | Authenticate; client requests may include the device `id` and base64 `uuid` to claim that registered device. |
+| `GET /api/peers` | Authenticated | List devices owned by the account; administrators can see all registered devices. |
+| `GET /api/device-group/accessible` | Authenticated | Returns an empty list until device groups are implemented. |
+| `GET /api/admin/peers` | Administrator | List all registered devices. |
+| `PUT /api/admin/peers/:id` | Administrator | Assign/unassign a device and edit its note; JSON body: `{"user":"alice","note":"..."}`. Use an empty `user` to unassign. |
+| `/api/admin/users` | Administrator | Create, update, list, and delete accounts. |
 
 The API defaults to loopback because it serves password-based login over HTTP.
 For remote use, configure an HTTPS reverse proxy and point clients to its API
