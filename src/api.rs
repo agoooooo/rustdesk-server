@@ -216,6 +216,7 @@ struct UserPayload {
     note: String,
     is_admin: bool,
     is_delegated_admin: bool,
+    delegated_permissions: Vec<String>,
     status: i64,
 }
 
@@ -230,6 +231,7 @@ impl From<User> for UserPayload {
             note: user.note,
             is_admin: user.is_admin,
             is_delegated_admin: false,
+            delegated_permissions: Vec::new(),
             status: user.status,
         }
     }
@@ -454,15 +456,7 @@ async fn login(
         log::error!("Failed to create API access token: {}", error);
         ApiError::internal()
     })?;
-    let mut user_payload = UserPayload::from(user);
-    user_payload.is_delegated_admin = state
-        .db
-        .delegated_access_exists(user_payload.id)
-        .await
-        .map_err(|error| {
-            log::error!("Failed to determine delegated role membership: {}", error);
-            ApiError::internal()
-        })?;
+    let user_payload = user_payload_with_delegated_permissions(&state, user).await?;
     Ok(Json(json!({
         "type": "access_token",
         "access_token": token,
@@ -479,16 +473,58 @@ async fn current_user(
     headers: HeaderMap,
 ) -> Result<Json<UserPayload>, ApiError> {
     let user = authenticated_user(&state, &headers).await?;
-    let mut user_payload = UserPayload::from(user);
-    user_payload.is_delegated_admin = state
+    let user_payload = user_payload_with_delegated_permissions(&state, user).await?;
+    Ok(Json(user_payload))
+}
+
+async fn user_payload_with_delegated_permissions(
+    state: &ApiState,
+    user: User,
+) -> Result<UserPayload, ApiError> {
+    let mut payload = UserPayload::from(user);
+    if payload.is_admin {
+        return Ok(payload);
+    }
+    let roles = state
         .db
-        .delegated_access_exists(user_payload.id)
+        .delegated_access_for_user(payload.id)
         .await
         .map_err(|error| {
-            log::error!("Failed to determine delegated role membership: {}", error);
+            log::error!(
+                "Failed to load delegated permissions for user info: {}",
+                error
+            );
             ApiError::internal()
         })?;
-    Ok(Json(user_payload))
+    let mut permissions = HashSet::new();
+    for role in roles {
+        let role_permissions =
+            serde_json::from_str::<Vec<String>>(&role.permissions).map_err(|error| {
+                log::error!(
+                    "Failed to decode delegated permissions for user info: {}",
+                    error
+                );
+                ApiError::internal()
+            })?;
+        for permission in role_permissions {
+            if !matches!(
+                permission.as_str(),
+                "users:read" | "users:write" | "devices:read" | "devices:write"
+            ) {
+                log::error!("Delegated role contains an unsupported permission");
+                return Err(ApiError::internal());
+            }
+            if let Some(resource) = permission.strip_suffix(":write") {
+                permissions.insert(format!("{resource}:read"));
+            }
+            permissions.insert(permission);
+        }
+    }
+    let mut permissions = permissions.into_iter().collect::<Vec<_>>();
+    permissions.sort_unstable();
+    payload.is_delegated_admin = !permissions.is_empty();
+    payload.delegated_permissions = permissions;
+    Ok(payload)
 }
 
 async fn logout(
@@ -3100,12 +3136,24 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(login_response["user"]["is_delegated_admin"], true);
+        assert_eq!(
+            login_response["user"]["delegated_permissions"],
+            json!(["devices:read", "devices:write", "users:read", "users:write"])
+        );
         assert!(
             current_user(Extension(state.clone()), delegated_headers.clone())
                 .await
                 .unwrap()
                 .0
                 .is_delegated_admin
+        );
+        assert_eq!(
+            current_user(Extension(state.clone()), delegated_headers.clone())
+                .await
+                .unwrap()
+                .0
+                .delegated_permissions,
+            vec!["devices:read", "devices:write", "users:read", "users:write"]
         );
         assert_eq!(
             create_admin_delegated_role(

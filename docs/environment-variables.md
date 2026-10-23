@@ -129,6 +129,11 @@ Delegated users cannot create/delete users, change account status or admin
 privileges, reassign devices, manage groups, roles, API tokens, address books,
 or audit logs. Role CRUD and membership assignment require an actual
 administrator login session.
+The login and current-user responses include the effective `delegated_permissions`
+for the signed-in user; write grants include read access for the same resource.
+The console uses these permissions to filter delegated navigation and editing
+controls. A new login is required to refresh the console navigation after a role
+change; API authorization is enforced immediately on every request.
 
 Relevant endpoints:
 

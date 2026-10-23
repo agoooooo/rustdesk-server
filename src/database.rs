@@ -843,16 +843,6 @@ impl Database {
         .await?)
     }
 
-    pub async fn delegated_access_exists(&self, user_id: i64) -> ResultType<bool> {
-        let exists: i64 = sqlx::query_scalar(
-            "select exists(select 1 from delegated_role_members m join delegated_roles r on r.id = m.role_id where m.user_id = ?)",
-        )
-        .bind(user_id)
-        .fetch_one(self.pool.get().await?.deref_mut())
-        .await?;
-        Ok(exists != 0)
-    }
-
     pub async fn create_user(
         &self,
         name: &str,
