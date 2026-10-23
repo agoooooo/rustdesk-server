@@ -15,6 +15,7 @@ use hbb_common::{anyhow, log, tokio};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
@@ -98,6 +99,14 @@ struct AuditLogQuery {
     actor: Option<String>,
     action: Option<String>,
     resource_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateApiTokenRequest {
+    name: String,
+    scopes: Vec<String>,
+    expires_in_days: i64,
 }
 
 #[derive(Deserialize)]
@@ -293,6 +302,14 @@ pub(crate) async fn start(
         .route("/api/admin/users", get(list_admin_users).post(create_user))
         .route("/api/admin/users/:id", put(update_user).delete(delete_user))
         .route("/api/admin/audit-logs", get(list_admin_audit_logs))
+        .route(
+            "/api/admin/api-tokens",
+            get(list_admin_api_tokens).post(create_admin_api_token),
+        )
+        .route(
+            "/api/admin/api-tokens/:id",
+            axum::routing::delete(revoke_admin_api_token),
+        )
         .layer(Extension(state))
         .layer(CorsLayer::permissive());
     let address = SocketAddr::new(bind_addr.unwrap_or(IpAddr::from([0, 0, 0, 0])), port);
@@ -445,7 +462,7 @@ async fn list_users(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    let user = authenticated_user(&state, &headers).await?;
+    let user = authenticated_scoped_user(&state, &headers, "users:read").await?;
     users_response(
         &state.db,
         query,
@@ -460,7 +477,7 @@ async fn list_admin_users(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    require_admin(&state, &headers, "users:read").await?;
     users_response(&state.db, query, false, None).await
 }
 
@@ -505,7 +522,7 @@ async fn list_peers(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    let user = authenticated_user(&state, &headers).await?;
+    let user = authenticated_scoped_user(&state, &headers, "devices:read").await?;
     peers_response(
         &state.db,
         &state.peer_map,
@@ -520,7 +537,7 @@ async fn list_groups(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    let user = authenticated_user(&state, &headers).await?;
+    let user = authenticated_scoped_user(&state, &headers, "groups:read").await?;
     let current = query.current.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
     let (groups, total) = state
@@ -543,7 +560,7 @@ async fn list_admin_device_groups(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    require_admin(&state, &headers, "groups:read").await?;
     let current = query.current.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
     let (groups, total) = state
@@ -566,7 +583,7 @@ async fn create_device_group(
     headers: HeaderMap,
     Json(request): Json<CreateDeviceGroup>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "groups:write").await?;
     validate_device_group(&request.name, &request.description)?;
     let id = state
         .db
@@ -599,7 +616,7 @@ async fn update_device_group(
     Path(id): Path<i64>,
     Json(request): Json<UpdateDeviceGroup>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "groups:write").await?;
     validate_device_group(&request.name, &request.description)?;
     let updated = state
         .db
@@ -629,7 +646,7 @@ async fn delete_device_group(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "groups:write").await?;
     let deleted = state.db.delete_device_group(id).await.map_err(|error| {
         log::error!("Failed to delete device group: {}", error);
         ApiError::internal()
@@ -657,7 +674,7 @@ async fn list_device_group_peers(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    require_admin(&state, &headers, "groups:read").await?;
     let peers = state
         .db
         .list_device_group_peers(id)
@@ -676,7 +693,7 @@ async fn update_device_group_peers(
     Path(id): Path<i64>,
     Json(request): Json<UpdateDeviceGroupPeers>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "groups:write").await?;
     if request.device_ids.len() > 2000 {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -767,7 +784,7 @@ async fn list_accessible_user_groups(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    let user = authenticated_user(&state, &headers).await?;
+    let user = authenticated_scoped_user(&state, &headers, "groups:read").await?;
     let current = query.current.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
     let (groups, total) = state
@@ -790,7 +807,7 @@ async fn list_admin_user_groups(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    require_admin(&state, &headers, "groups:read").await?;
     let current = query.current.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
     let (groups, total) = state
@@ -813,7 +830,7 @@ async fn create_user_group(
     headers: HeaderMap,
     Json(request): Json<CreateUserGroup>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "groups:write").await?;
     validate_user_group(&request.name, &request.description)?;
     let id = state
         .db
@@ -846,7 +863,7 @@ async fn update_user_group(
     Path(id): Path<i64>,
     Json(request): Json<UpdateUserGroup>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "groups:write").await?;
     validate_user_group(&request.name, &request.description)?;
     let updated = state
         .db
@@ -873,7 +890,7 @@ async fn delete_user_group(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "groups:write").await?;
     let deleted = state.db.delete_user_group(id).await.map_err(|error| {
         log::error!("Failed to delete user group: {}", error);
         ApiError::internal()
@@ -898,7 +915,7 @@ async fn list_user_group_members(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    require_admin(&state, &headers, "groups:read").await?;
     let user_ids = state
         .db
         .list_user_group_members(id)
@@ -917,7 +934,7 @@ async fn update_user_group_members(
     Path(id): Path<i64>,
     Json(request): Json<UpdateUserGroupMembers>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "groups:write").await?;
     if request.user_ids.len() > 2000 {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -1005,7 +1022,7 @@ async fn list_accessible_address_books(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    let user = authenticated_user(&state, &headers).await?;
+    let user = authenticated_scoped_user(&state, &headers, "address_books:read").await?;
     let current = query.current.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
     let offset = current.saturating_sub(1).saturating_mul(page_size);
@@ -1033,7 +1050,7 @@ async fn list_personal_address_books(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    let user = authenticated_user(&state, &headers).await?;
+    let user = authenticated_scoped_user(&state, &headers, "address_books:read").await?;
     let current = query.current.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
     let offset = current.saturating_sub(1).saturating_mul(page_size);
@@ -1057,7 +1074,7 @@ async fn create_personal_address_book(
     headers: HeaderMap,
     Json(request): Json<AddressBookRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let actor = authenticated_user(&state, &headers).await?;
+    let actor = authenticated_scoped_user(&state, &headers, "address_books:write").await?;
     validate_address_book(&request.name, &request.description)?;
     let id = state
         .db
@@ -1092,7 +1109,7 @@ async fn update_personal_address_book(
     Path(id): Path<i64>,
     Json(request): Json<AddressBookRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = authenticated_user(&state, &headers).await?;
+    let actor = authenticated_scoped_user(&state, &headers, "address_books:write").await?;
     validate_address_book(&request.name, &request.description)?;
     let updated = state
         .db
@@ -1127,7 +1144,7 @@ async fn delete_personal_address_book(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = authenticated_user(&state, &headers).await?;
+    let actor = authenticated_scoped_user(&state, &headers, "address_books:write").await?;
     let deleted = state
         .db
         .delete_personal_address_book(actor.id, id)
@@ -1159,7 +1176,7 @@ async fn list_admin_address_books(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    require_admin(&state, &headers, "address_books:read").await?;
     let current = query.current.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
     let offset = current.saturating_sub(1).saturating_mul(page_size);
@@ -1183,7 +1200,7 @@ async fn create_address_book(
     headers: HeaderMap,
     Json(request): Json<AddressBookRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "address_books:write").await?;
     validate_address_book(&request.name, &request.description)?;
     let id = state
         .db
@@ -1217,7 +1234,7 @@ async fn update_address_book(
     Path(id): Path<i64>,
     Json(request): Json<AddressBookRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "address_books:write").await?;
     validate_address_book(&request.name, &request.description)?;
     let updated = state
         .db
@@ -1247,7 +1264,7 @@ async fn delete_address_book(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "address_books:write").await?;
     let deleted = state.db.delete_address_book(id).await.map_err(|error| {
         log::error!("Failed to delete address book: {}", error);
         ApiError::internal()
@@ -1533,7 +1550,12 @@ async fn require_address_book_access(
     book_id: i64,
     required: &str,
 ) -> Result<User, ApiError> {
-    let user = authenticated_user(state, headers).await?;
+    let required_scope = if required == "read" {
+        "address_books:read"
+    } else {
+        "address_books:write"
+    };
+    let user = authenticated_scoped_user(state, headers, required_scope).await?;
     let owner = state
         .db
         .address_book_owner(book_id)
@@ -1683,7 +1705,7 @@ async fn list_admin_peers(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    require_admin(&state, &headers, "devices:read").await?;
     peers_response(&state.db, &state.peer_map, query, None).await
 }
 
@@ -1692,7 +1714,7 @@ async fn list_admin_audit_logs(
     headers: HeaderMap,
     Query(query): Query<AuditLogQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    require_admin(&state, &headers, "audit:read").await?;
     let actor = query
         .actor
         .as_deref()
@@ -1733,6 +1755,163 @@ async fn list_admin_audit_logs(
     ))
 }
 
+async fn list_admin_api_tokens(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let actor = require_admin_session(&state, &headers).await?;
+    let tokens = state.db.list_api_tokens(actor.id).await.map_err(|error| {
+        log::error!("Failed to list API tokens: {}", error);
+        ApiError::internal()
+    })?;
+    let data = tokens
+        .into_iter()
+        .map(|token| {
+            let scopes = serde_json::from_str::<Vec<String>>(&token.scopes).map_err(|error| {
+                log::error!("Failed to decode API token scopes: {}", error);
+                ApiError::internal()
+            })?;
+            Ok(json!({
+                "id": token.id,
+                "name": token.name,
+                "token_prefix": token.token_prefix,
+                "scopes": scopes,
+                "expires_at": token.expires_at,
+                "created_at": token.created_at,
+                "last_used_at": token.last_used_at,
+                "revoked_at": token.revoked_at,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Json(json!({ "data": data })))
+}
+
+async fn create_admin_api_token(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateApiTokenRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let actor = require_admin_session(&state, &headers).await?;
+    let name = request.name.trim();
+    if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Token name must be 1-80 bytes and contain no control characters",
+        ));
+    }
+    if !(1..=365).contains(&request.expires_in_days) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Token expiration must be between 1 and 365 days",
+        ));
+    }
+    let allowed_scopes = [
+        "users:read",
+        "users:write",
+        "devices:read",
+        "devices:write",
+        "groups:read",
+        "groups:write",
+        "address_books:read",
+        "address_books:write",
+        "audit:read",
+    ];
+    let mut unique_scopes = HashSet::with_capacity(request.scopes.len());
+    if request.scopes.is_empty()
+        || request.scopes.len() > allowed_scopes.len()
+        || request
+            .scopes
+            .iter()
+            .any(|scope| !allowed_scopes.contains(&scope.as_str()) || !unique_scopes.insert(scope))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Select one or more valid, unique token scopes",
+        ));
+    }
+    let expires_at = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::days(request.expires_in_days))
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Invalid token expiration"))?
+        .to_rfc3339();
+    let token = format!("rdc_{}", uuid::Uuid::new_v4().simple());
+    let token_prefix = token.chars().take(12).collect::<String>();
+    let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let scopes_json = serde_json::to_string(&request.scopes).map_err(|error| {
+        log::error!("Failed to encode API token scopes: {}", error);
+        ApiError::internal()
+    })?;
+    let id = state
+        .db
+        .create_api_token(
+            actor.id,
+            name,
+            &token_prefix,
+            &token_hash,
+            &scopes_json,
+            &expires_at,
+        )
+        .await
+        .map_err(|error| {
+            log::error!("Failed to create API token: {}", error);
+            ApiError::internal()
+        })?;
+    if let Err(error) = record_admin_audit(
+        &state,
+        &actor,
+        "create",
+        "api_token",
+        &id.to_string(),
+        "Created an API token",
+    )
+    .await
+    {
+        if let Err(revoke_error) = state.db.revoke_api_token(actor.id, id).await {
+            log::error!("Failed to revoke unaudited API token: {}", revoke_error);
+        }
+        return Err(error);
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": id,
+            "name": name,
+            "token": token,
+            "token_prefix": token_prefix,
+            "scopes": request.scopes,
+            "expires_at": expires_at,
+        })),
+    ))
+}
+
+async fn revoke_admin_api_token(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let actor = require_admin_session(&state, &headers).await?;
+    let revoked = state
+        .db
+        .revoke_api_token(actor.id, id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to revoke API token: {}", error);
+            ApiError::internal()
+        })?;
+    if !revoked {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "API token not found"));
+    }
+    record_admin_audit(
+        &state,
+        &actor,
+        "delete",
+        "api_token",
+        &id.to_string(),
+        "Revoked an API token",
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdatePeer {
@@ -1748,7 +1927,7 @@ async fn update_peer(
     Path(id): Path<String>,
     Json(request): Json<UpdatePeer>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "devices:write").await?;
     if id.trim().is_empty() || id.len() > crate::peer::MAX_PEER_ID_LEN {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Invalid device ID"));
     }
@@ -1846,7 +2025,7 @@ async fn create_user(
     headers: HeaderMap,
     Json(request): Json<CreateUser>,
 ) -> Result<(StatusCode, Json<UserPayload>), ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "users:write").await?;
     validate_name(&request.name)?;
     validate_email(&request.email)?;
     validate_password(&request.password)?;
@@ -1892,7 +2071,7 @@ async fn update_user(
     Path(id): Path<i64>,
     Json(request): Json<UpdateUser>,
 ) -> Result<Json<UserPayload>, ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "users:write").await?;
     if request.status != 0 && request.status != 1 {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -1972,7 +2151,7 @@ async fn delete_user(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers, "users:write").await?;
     let target = state
         .db
         .get_user_by_id(id)
@@ -2016,12 +2195,78 @@ async fn delete_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn require_admin(state: &ApiState, headers: &HeaderMap) -> Result<User, ApiError> {
+async fn require_admin(
+    state: &ApiState,
+    headers: &HeaderMap,
+    required_scope: &str,
+) -> Result<User, ApiError> {
+    let user = authenticated_scoped_user(state, headers, required_scope).await?;
+    if !user.is_admin {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "Admin required!"));
+    }
+    Ok(user)
+}
+
+async fn require_admin_session(state: &ApiState, headers: &HeaderMap) -> Result<User, ApiError> {
     let user = authenticated_user(state, headers).await?;
     if !user.is_admin {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "Admin required!"));
     }
     Ok(user)
+}
+
+async fn authenticated_scoped_user(
+    state: &ApiState,
+    headers: &HeaderMap,
+    required_scope: &str,
+) -> Result<User, ApiError> {
+    let token = authorization_token(headers)?;
+    if token.starts_with("rdc_") {
+        let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let token_auth = state
+            .db
+            .authenticate_api_token(&token_hash)
+            .await
+            .map_err(|error| {
+                log::error!("Failed to authenticate API token: {}", error);
+                ApiError::internal()
+            })?
+            .ok_or_else(|| {
+                ApiError::new(StatusCode::UNAUTHORIZED, "Invalid or expired API token")
+            })?;
+        let user = state
+            .db
+            .get_user_by_id(token_auth.owner_id)
+            .await
+            .map_err(|error| {
+                log::error!("Failed to load API token owner: {}", error);
+                ApiError::internal()
+            })?
+            .filter(|user| user.status == 1 && user.is_admin)
+            .ok_or_else(|| {
+                ApiError::new(StatusCode::UNAUTHORIZED, "API token owner is unavailable")
+            })?;
+        let scopes = serde_json::from_str::<Vec<String>>(&token_auth.scopes).map_err(|error| {
+            log::error!("Failed to decode API token scopes: {}", error);
+            ApiError::internal()
+        })?;
+        if !api_token_scope_allows(&scopes, required_scope) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "API token scope is insufficient",
+            ));
+        }
+        return Ok(user);
+    }
+    authenticated_user(state, headers).await
+}
+
+fn api_token_scope_allows(scopes: &[String], required_scope: &str) -> bool {
+    scopes.iter().any(|scope| {
+        scope == required_scope
+            || (required_scope.ends_with(":read")
+                && scope.strip_suffix(":write") == required_scope.strip_suffix(":read"))
+    })
 }
 
 async fn record_admin_audit(
@@ -2065,22 +2310,24 @@ fn valid_audit_action(action: &str) -> bool {
 fn valid_audit_resource_type(resource_type: &str) -> bool {
     matches!(
         resource_type,
-        "user" | "device" | "device_group" | "user_group" | "address_book" | "address_book_entry"
+        "user"
+            | "device"
+            | "device_group"
+            | "user_group"
+            | "address_book"
+            | "address_book_entry"
+            | "api_token"
     )
 }
 
 async fn authenticated_user(state: &ApiState, headers: &HeaderMap) -> Result<User, ApiError> {
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .or_else(|| {
-            headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.strip_prefix("access_token "))
-        })
-        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "Authentication required"))?;
+    let token = authorization_token(headers)?;
+    if token.starts_with("rdc_") {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "API tokens are limited to scoped administrator endpoints",
+        ));
+    }
     let claims = decode::<Claims>(
         token,
         &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
@@ -2098,6 +2345,20 @@ async fn authenticated_user(state: &ApiState, headers: &HeaderMap) -> Result<Use
         })?;
     user.filter(|user| user.status == 1)
         .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "Account is disabled"))
+}
+
+fn authorization_token(headers: &HeaderMap) -> Result<&str, ApiError> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .or_else(|| {
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("access_token "))
+        })
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "Authentication required"))
 }
 
 fn validate_name(name: &str) -> Result<(), ApiError> {
@@ -2189,6 +2450,15 @@ mod tests {
         assert!(validate_user_group(" ", "").is_err());
         assert!(validate_user_group("Control\nGroup", "").is_err());
         assert!(validate_user_group("Valid", &"x".repeat(301)).is_err());
+    }
+
+    #[test]
+    fn api_token_write_scopes_include_read_access_only_within_their_resource() {
+        let scopes = vec!["users:write".to_owned()];
+        assert!(api_token_scope_allows(&scopes, "users:read"));
+        assert!(api_token_scope_allows(&scopes, "users:write"));
+        assert!(!api_token_scope_allows(&scopes, "devices:read"));
+        assert!(!api_token_scope_allows(&scopes, "audit:read"));
     }
 
     #[test]
@@ -2608,6 +2878,200 @@ mod tests {
     #[test]
     fn personal_address_books_are_owner_scoped_and_removed_with_their_owner() {
         personal_address_book_api_flow();
+    }
+
+    #[test]
+    fn api_tokens_are_scoped_owner_bound_and_revocable() {
+        api_token_api_flow();
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    async fn api_token_api_flow() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(file.path().to_str().unwrap()).await.unwrap();
+        let admin_id = db
+            .create_user(
+                "admin",
+                "Admin",
+                "admin@example.com",
+                &hash("admin-test-password", DEFAULT_COST).unwrap(),
+                true,
+            )
+            .await
+            .unwrap();
+        db.create_user(
+            "other-admin",
+            "Other Admin",
+            "other-admin@example.com",
+            &hash("other-test-password", DEFAULT_COST).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        let state = ApiState {
+            db: db.clone(),
+            jwt_secret: "api-token-test-secret".to_owned(),
+            peer_map: PeerMap::with_database(db.clone()),
+        };
+        let admin_headers = test_auth_headers(&state, "admin");
+        assert_eq!(
+            create_admin_api_token(
+                Extension(state.clone()),
+                admin_headers.clone(),
+                Json(CreateApiTokenRequest {
+                    name: "Invalid".to_owned(),
+                    scopes: vec!["admin:*".to_owned()],
+                    expires_in_days: 30,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, created) = create_admin_api_token(
+            Extension(state.clone()),
+            admin_headers.clone(),
+            Json(CreateApiTokenRequest {
+                name: "Automation".to_owned(),
+                scopes: vec!["users:read".to_owned(), "address_books:read".to_owned()],
+                expires_in_days: 30,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        let secret = created.0["token"].as_str().unwrap().to_owned();
+        let token_id = created.0["id"].as_i64().unwrap();
+        assert_eq!(created.0["token_prefix"], &secret[..12]);
+        let token_audit = list_admin_audit_logs(
+            Extension(state.clone()),
+            admin_headers.clone(),
+            Query(AuditLogQuery {
+                current: Some(1),
+                page_size: Some(20),
+                actor: None,
+                action: Some("create".to_owned()),
+                resource_type: Some("api_token".to_owned()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(token_audit["total"], 1);
+        assert_eq!(token_audit["data"][0]["summary"], "Created an API token");
+        assert!(!token_audit["data"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains(&secret));
+
+        let mut token_headers = HeaderMap::new();
+        token_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {secret}").parse().unwrap(),
+        );
+        assert!(list_admin_users(
+            Extension(state.clone()),
+            token_headers.clone(),
+            Query(Pagination {
+                current: Some(1),
+                page_size: Some(20),
+                status: None,
+            }),
+        )
+        .await
+        .is_ok());
+        assert!(require_admin(&state, &token_headers, "users:read")
+            .await
+            .is_ok());
+        assert!(
+            authenticated_scoped_user(&state, &token_headers, "address_books:read")
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            require_admin(&state, &token_headers, "users:write")
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            require_admin(&state, &token_headers, "devices:read")
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            authenticated_user(&state, &token_headers)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let listed = list_admin_api_tokens(Extension(state.clone()), admin_headers.clone())
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(listed["data"].as_array().unwrap().len(), 1);
+        assert!(listed["data"][0].get("token").is_none());
+        assert_eq!(listed["data"][0]["scopes"][0], "users:read");
+        assert_eq!(
+            list_admin_api_tokens(
+                Extension(state.clone()),
+                test_auth_headers(&state, "other-admin"),
+            )
+            .await
+            .unwrap()
+            .0["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            revoke_admin_api_token(
+                Extension(state.clone()),
+                test_auth_headers(&state, "other-admin"),
+                Path(token_id),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            revoke_admin_api_token(Extension(state.clone()), admin_headers, Path(token_id),)
+                .await
+                .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            require_admin(&state, &token_headers, "users:read")
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+        let expired_hash = format!("{:x}", Sha256::digest(b"expired-token"));
+        db.create_api_token(
+            admin_id,
+            "Expired",
+            "rdc_expired",
+            &expired_hash,
+            r#"["users:read"]"#,
+            "2000-01-01T00:00:00+00:00",
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .authenticate_api_token(&expired_hash)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db.get_user_by_id(admin_id).await.unwrap().is_some());
     }
 
     #[tokio::main(flavor = "current_thread")]

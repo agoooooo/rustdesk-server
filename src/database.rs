@@ -116,6 +116,24 @@ pub struct AuditLog {
     pub created_at: String,
 }
 
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+pub struct ApiToken {
+    pub id: i64,
+    pub name: String,
+    pub token_prefix: String,
+    pub scopes: String,
+    pub expires_at: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct ApiTokenAuth {
+    pub owner_id: i64,
+    pub scopes: String,
+}
+
 impl Database {
     pub async fn new(url: &str) -> ResultType<Database> {
         if !std::path::Path::new(url).exists() {
@@ -244,7 +262,21 @@ impl Database {
             create index if not exists index_admin_audit_logs_created_at
                 on admin_audit_logs (created_at);
             create index if not exists index_admin_audit_logs_actor
-                on admin_audit_logs (actor_name, created_at);",
+                on admin_audit_logs (actor_name, created_at);
+            create table if not exists api_tokens (
+                id integer primary key autoincrement,
+                owner_id integer not null,
+                name varchar(80) not null,
+                token_prefix varchar(16) not null,
+                token_hash varchar(64) not null unique,
+                scopes text not null,
+                expires_at datetime not null,
+                created_at datetime not null default(current_timestamp),
+                last_used_at datetime,
+                revoked_at datetime
+            );
+            create index if not exists index_api_tokens_owner
+                on api_tokens (owner_id, created_at);",
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
@@ -555,6 +587,10 @@ impl Database {
             .execute(conn.deref_mut())
             .await?;
         sqlx::query("delete from user_group_members where user_id = ?")
+            .bind(id)
+            .execute(conn.deref_mut())
+            .await?;
+        sqlx::query("delete from api_tokens where owner_id = ?")
             .bind(id)
             .execute(conn.deref_mut())
             .await?;
@@ -1248,6 +1284,77 @@ impl Database {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn create_api_token(
+        &self,
+        owner_id: i64,
+        name: &str,
+        token_prefix: &str,
+        token_hash: &str,
+        scopes: &str,
+        expires_at: &str,
+    ) -> ResultType<i64> {
+        let result = sqlx::query(
+            "insert into api_tokens(owner_id, name, token_prefix, token_hash, scopes, expires_at) \
+             values(?, ?, ?, ?, ?, ?)",
+        )
+        .bind(owner_id)
+        .bind(name)
+        .bind(token_prefix)
+        .bind(token_hash)
+        .bind(scopes)
+        .bind(expires_at)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn list_api_tokens(&self, owner_id: i64) -> ResultType<Vec<ApiToken>> {
+        Ok(sqlx::query_as::<_, ApiToken>(
+            "select id, name, token_prefix, scopes, expires_at, created_at, last_used_at, revoked_at \
+             from api_tokens where owner_id = ? order by id desc",
+        )
+        .bind(owner_id)
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    pub async fn revoke_api_token(&self, owner_id: i64, id: i64) -> ResultType<bool> {
+        let result = sqlx::query(
+            "update api_tokens set revoked_at = current_timestamp \
+             where id = ? and owner_id = ? and revoked_at is null",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn authenticate_api_token(
+        &self,
+        token_hash: &str,
+    ) -> ResultType<Option<ApiTokenAuth>> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let token = sqlx::query_as::<_, ApiTokenAuth>(
+            "select owner_id, scopes from api_tokens \
+             where token_hash = ? and revoked_at is null and datetime(expires_at) > datetime('now')",
+        )
+        .bind(token_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if token.is_some() {
+            sqlx::query(
+                "update api_tokens set last_used_at = current_timestamp where token_hash = ?",
+            )
+            .bind(token_hash)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(token)
     }
 
     pub async fn list_admin_audit_logs(

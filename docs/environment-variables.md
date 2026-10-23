@@ -103,9 +103,20 @@ or unattended-access settings.
 
 Successful management changes to users, devices, groups, and address books are
 recorded in an administrator-readable operation log. This records
-action and resource identifiers, not passwords, tokens, notes, or full request
+action and resource identifiers, not passwords, token secrets, notes, or full request
 bodies. The log keeps the newest 100,000 entries. Connection sessions, file
 transfers, alerts, and failed requests are not included.
+
+Administrators can create API tokens for automation. The random `rdc_` secret is
+shown only in the creation response; SQLite stores only its SHA-256 digest.
+Tokens require one or more explicit scopes and expire after 1–365 days. Every
+request checks token revocation/expiry and that its owner is still an active
+administrator. A `:write` scope also permits reads in the same resource area.
+Supported scopes are `users:read/write`, `devices:read/write`,
+`groups:read/write`, `address_books:read/write`, and `audit:read`. Token
+creation, listing, and revocation require an administrator login session and
+cannot be performed with an API token. Deleting an administrator also deletes
+their tokens.
 
 Relevant endpoints:
 
@@ -132,6 +143,14 @@ Relevant endpoints:
 | `/api/admin/address-books/:id` | Administrator | Update or delete a shared address book. |
 | `/api/admin/users` | Administrator | Create, update, list, and delete accounts. |
 | `GET /api/admin/audit-logs` | Administrator | List successful management mutations; supports `current`, `pageSize`, `actor`, `action`, and `resourceType` filters. |
+| `GET /api/admin/api-tokens` | Administrator session | List the current administrator's token metadata; secret values are never returned. |
+| `POST /api/admin/api-tokens` | Administrator session | Create a scoped token; body: `{"name":"automation","scopes":["users:read"],"expiresInDays":90}`. The response contains the secret once. |
+| `DELETE /api/admin/api-tokens/:id` | Token owner administrator session | Revoke the current administrator's token immediately. |
+
+Scoped API tokens can access the existing authenticated and administrator
+endpoints for their selected resource scopes. They cannot access login/session
+endpoints or manage API tokens. Store them as `Authorization: Bearer rdc_…`;
+do not place secrets in URLs or logs.
 
 The API defaults to loopback because it serves password-based login over HTTP.
 For remote use, configure an HTTPS reverse proxy and point clients to its API
