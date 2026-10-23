@@ -70,6 +70,14 @@ pub struct DeviceGroup {
     pub device_count: i64,
 }
 
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+pub struct UserGroup {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub member_count: i64,
+}
+
 impl Database {
     pub async fn new(url: &str) -> ResultType<Database> {
         if !std::path::Path::new(url).exists() {
@@ -144,7 +152,20 @@ impl Database {
                 primary key (group_id, peer_id)
             );
             create index if not exists index_device_group_peers_peer_id
-                on device_group_peers (peer_id);",
+                on device_group_peers (peer_id);
+            create table if not exists user_groups (
+                id integer primary key autoincrement,
+                name varchar(100) not null collate nocase unique,
+                description varchar(300) not null default '',
+                created_at datetime not null default(current_timestamp)
+            );
+            create table if not exists user_group_members (
+                group_id integer not null,
+                user_id integer not null,
+                primary key (group_id, user_id)
+            );
+            create index if not exists index_user_group_members_user_id
+                on user_group_members (user_id);",
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
@@ -288,7 +309,12 @@ impl Database {
         .await?)
     }
 
-    pub async fn list_users(&self, status: Option<i64>, limit: i64, offset: i64) -> ResultType<(Vec<User>, i64)> {
+    pub async fn list_users(
+        &self,
+        status: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<User>, i64)> {
         let mut conn = self.pool.get().await?;
         let (users, total) = if let Some(status) = status {
             let users = sqlx::query_as::<_, User>(
@@ -341,7 +367,14 @@ impl Database {
         Ok(result.last_insert_rowid())
     }
 
-    pub async fn update_user(&self, id: i64, display_name: &str, email: &str, is_admin: bool, status: i64) -> ResultType<()> {
+    pub async fn update_user(
+        &self,
+        id: i64,
+        display_name: &str,
+        email: &str,
+        is_admin: bool,
+        status: i64,
+    ) -> ResultType<()> {
         sqlx::query(
             "update users set display_name = ?, email = ?, is_admin = ?, status = ? where id = ?",
         )
@@ -376,6 +409,10 @@ impl Database {
                 .execute(conn.deref_mut())
                 .await?;
         }
+        sqlx::query("delete from user_group_members where user_id = ?")
+            .bind(id)
+            .execute(conn.deref_mut())
+            .await?;
         sqlx::query("delete from users where id = ?")
             .bind(id)
             .execute(conn.deref_mut())
@@ -384,9 +421,11 @@ impl Database {
     }
 
     pub async fn count_admins(&self) -> ResultType<i64> {
-        Ok(sqlx::query_scalar("select count(*) from users where is_admin = 1 and status = 1")
-            .fetch_one(self.pool.get().await?.deref_mut())
-            .await?)
+        Ok(
+            sqlx::query_scalar("select count(*) from users where is_admin = 1 and status = 1")
+                .fetch_one(self.pool.get().await?.deref_mut())
+                .await?,
+        )
     }
 
     pub async fn list_device_groups(
@@ -527,15 +566,153 @@ impl Database {
         Ok((groups, total))
     }
 
+    pub async fn list_user_groups(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<UserGroup>, i64)> {
+        let mut conn = self.pool.get().await?;
+        let groups = sqlx::query_as::<_, UserGroup>(
+            "select g.id, g.name, g.description, count(gm.user_id) as member_count \
+             from user_groups g left join user_group_members gm on gm.group_id = g.id \
+             group by g.id order by g.name collate nocase limit ? offset ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        let total = sqlx::query_scalar("select count(*) from user_groups")
+            .fetch_one(conn.deref_mut())
+            .await?;
+        Ok((groups, total))
+    }
+
+    pub async fn create_user_group(&self, name: &str, description: &str) -> ResultType<i64> {
+        let result = sqlx::query("insert into user_groups(name, description) values(?, ?)")
+            .bind(name)
+            .bind(description)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn update_user_group(
+        &self,
+        id: i64,
+        name: &str,
+        description: &str,
+    ) -> ResultType<bool> {
+        let result = sqlx::query("update user_groups set name = ?, description = ? where id = ?")
+            .bind(name)
+            .bind(description)
+            .bind(id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delete_user_group(&self, id: i64) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let result = sqlx::query("delete from user_groups where id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 1 {
+            sqlx::query("delete from user_group_members where group_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn list_user_group_members(&self, id: i64) -> ResultType<Option<Vec<i64>>> {
+        let mut conn = self.pool.get().await?;
+        let exists: Option<i64> = sqlx::query_scalar("select id from user_groups where id = ?")
+            .bind(id)
+            .fetch_optional(conn.deref_mut())
+            .await?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+        let members = sqlx::query_scalar(
+            "select user_id from user_group_members where group_id = ? order by user_id",
+        )
+        .bind(id)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        Ok(Some(members))
+    }
+
+    pub async fn set_user_group_members(&self, id: i64, members: &[i64]) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let exists: Option<i64> = sqlx::query_scalar("select id from user_groups where id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("delete from user_group_members where group_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for member_id in members {
+            sqlx::query("insert into user_group_members(group_id, user_id) values(?, ?)")
+                .bind(id)
+                .bind(member_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn list_accessible_user_groups(
+        &self,
+        user_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<UserGroup>, i64)> {
+        let mut conn = self.pool.get().await?;
+        let groups = sqlx::query_as::<_, UserGroup>(
+            "select g.id, g.name, g.description, count(gm.user_id) as member_count \
+             from user_groups g \
+             join user_group_members mine on mine.group_id = g.id \
+             join user_group_members gm on gm.group_id = g.id \
+             where mine.user_id = ? \
+             group by g.id order by g.name collate nocase limit ? offset ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        let total = sqlx::query_scalar(
+            "select count(*) from user_groups g \
+             join user_group_members gm on gm.group_id = g.id where gm.user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_one(conn.deref_mut())
+        .await?;
+        Ok((groups, total))
+    }
+
     pub async fn get_or_create_api_secret(&self) -> ResultType<String> {
         let mut conn = self.pool.get().await?;
         sqlx::query("insert or ignore into app_config(key, value) values('api_secret', ?)")
             .bind(uuid::Uuid::new_v4().to_string())
             .execute(conn.deref_mut())
             .await?;
-        Ok(sqlx::query_scalar("select value from app_config where key = 'api_secret'")
-            .fetch_one(conn.deref_mut())
-            .await?)
+        Ok(
+            sqlx::query_scalar("select value from app_config where key = 'api_secret'")
+                .fetch_one(conn.deref_mut())
+                .await?,
+        )
     }
 }
 

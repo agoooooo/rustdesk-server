@@ -81,10 +81,13 @@ tokens expire after eight hours.
 Device groups can be created and managed by administrators, with devices
 assigned to groups. The authenticated accessible-group endpoint lists groups
 containing devices owned by that account; group membership does not grant
-connection access. The API does not enforce connection authorization based on
-account ownership. Ownership controls device inventory visibility only; it does
-not replace the target device's password, confirmation, or unattended-access
-settings.
+connection access. User groups can also be created and managed by
+administrators, with active users assigned as members. Authenticated users can
+list their own groups; this membership currently does not grant access to
+devices or other group members' resources. The API does not enforce connection
+authorization based on account ownership. Ownership controls device inventory
+visibility only; it does not replace the target device's password,
+confirmation, or unattended-access settings.
 
 Relevant endpoints:
 
@@ -97,6 +100,9 @@ Relevant endpoints:
 | `PUT /api/admin/peers/:id` | Administrator | Assign/unassign a device and edit its note; JSON body: `{"user":"alice","note":"..."}`. Use an empty `user` to unassign. |
 | `/api/admin/device-groups` | Administrator | Create, list, update, and delete device groups. |
 | `/api/admin/device-groups/:id/devices` | Administrator | Read or replace group membership; JSON body: `{"device_ids":["device-id"]}`. |
+| `GET /api/user-group/accessible` | Authenticated | List user groups of which the current account is a member. |
+| `/api/admin/user-groups` | Administrator | Create, list, update, and delete user groups. |
+| `/api/admin/user-groups/:id/users` | Administrator | Read or replace group membership; JSON body: `{"user_ids":[1,2]}`. Only active users can be assigned. |
 | `/api/admin/users` | Administrator | Create, update, list, and delete accounts. |
 
 The API defaults to loopback because it serves password-based login over HTTP.
