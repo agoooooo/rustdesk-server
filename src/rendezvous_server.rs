@@ -182,7 +182,16 @@ impl RendezvousServer {
                 .map(|value| value.parse::<IpAddr>())
                 .transpose()?
                 .or(Some(IpAddr::from([127, 0, 0, 1])));
-            Some(crate::api::start(api_peer_map, api_bind, api_port).await?)
+            Some(
+                crate::api::start(
+                    api_peer_map,
+                    api_bind,
+                    api_port,
+                    bind_addr,
+                    u16::try_from(port)?,
+                )
+                .await?,
+            )
         } else {
             None
         };

@@ -185,6 +185,19 @@ impl PeerMap {
         online
     }
 
+    pub(crate) async fn online_count(&self) -> usize {
+        let peers = self.map.read().await.values().cloned().collect::<Vec<_>>();
+        let mut count = 0;
+        for peer in peers {
+            if peer.read().await.last_reg_time.elapsed().as_millis()
+                < crate::rendezvous_server::REG_TIMEOUT as u128
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)

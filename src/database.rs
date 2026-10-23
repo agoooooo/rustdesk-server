@@ -153,6 +153,15 @@ pub struct DelegatedRoleAccess {
     pub device_group_ids: String,
 }
 
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct ServiceResourceCounts {
+    pub total_users: i64,
+    pub active_users: i64,
+    pub total_devices: i64,
+    pub device_groups: i64,
+    pub user_groups: i64,
+}
+
 impl Database {
     pub async fn new(url: &str) -> ResultType<Database> {
         if !std::path::Path::new(url).exists() {
@@ -949,6 +958,19 @@ impl Database {
                 .fetch_one(self.pool.get().await?.deref_mut())
                 .await?,
         )
+    }
+
+    pub async fn service_resource_counts(&self) -> ResultType<ServiceResourceCounts> {
+        Ok(sqlx::query_as::<_, ServiceResourceCounts>(
+            "select \
+               (select count(*) from users) as total_users, \
+               (select count(*) from users where status = 1) as active_users, \
+               (select count(*) from peer) as total_devices, \
+               (select count(*) from device_groups) as device_groups, \
+               (select count(*) from user_groups) as user_groups",
+        )
+        .fetch_one(self.pool.get().await?.deref_mut())
+        .await?)
     }
 
     pub async fn list_device_groups(

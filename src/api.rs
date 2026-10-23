@@ -1,5 +1,5 @@
 use crate::{
-    common::get_arg_opt,
+    common::{get_arg, get_arg_opt},
     database::{AddressBookPermission, Database, DelegatedRole, User},
     peer::PeerMap,
 };
@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tower_http::cors::CorsLayer;
 
@@ -28,6 +28,10 @@ struct ApiState {
     db: Database,
     jwt_secret: String,
     peer_map: PeerMap,
+    started_at: Instant,
+    api_address: SocketAddr,
+    rendezvous_address: SocketAddr,
+    relay_servers: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -241,14 +245,30 @@ pub(crate) async fn start(
     peer_map: PeerMap,
     bind_addr: Option<IpAddr>,
     port: u16,
+    rendezvous_bind_addr: Option<IpAddr>,
+    rendezvous_port: u16,
 ) -> hbb_common::ResultType<tokio::task::JoinHandle<hbb_common::ResultType<()>>> {
     let db = peer_map.db.clone();
     let jwt_secret = db.get_or_create_api_secret().await?;
     bootstrap_admin(&db).await?;
+    let api_address = SocketAddr::new(bind_addr.unwrap_or(IpAddr::from([0, 0, 0, 0])), port);
+    let rendezvous_address = SocketAddr::new(
+        rendezvous_bind_addr.unwrap_or(IpAddr::from([0, 0, 0, 0])),
+        rendezvous_port,
+    );
     let state = ApiState {
         db,
         jwt_secret,
         peer_map,
+        started_at: Instant::now(),
+        api_address,
+        rendezvous_address,
+        relay_servers: get_arg("relay-servers")
+            .split(',')
+            .map(str::trim)
+            .filter(|server| !server.is_empty() && server.len() <= 300)
+            .map(str::to_owned)
+            .collect(),
     };
     let app = Router::new()
         .route("/api/login", post(login))
@@ -328,6 +348,7 @@ pub(crate) async fn start(
             put(update_admin_delegated_role).delete(delete_admin_delegated_role),
         )
         .route("/api/admin/audit-logs", get(list_admin_audit_logs))
+        .route("/api/admin/server-status", get(get_admin_server_status))
         .route(
             "/api/admin/api-tokens",
             get(list_admin_api_tokens).post(create_admin_api_token),
@@ -338,10 +359,9 @@ pub(crate) async fn start(
         )
         .layer(Extension(state))
         .layer(CorsLayer::permissive());
-    let address = SocketAddr::new(bind_addr.unwrap_or(IpAddr::from([0, 0, 0, 0])), port);
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let listener = tokio::net::TcpListener::bind(api_address).await?;
     let listener = listener.into_std()?;
-    log::info!("User API listening on http://{}", address);
+    log::info!("User API listening on http://{}", api_address);
     let server = axum::Server::from_tcp(listener)?;
     Ok(tokio::spawn(async move {
         server
@@ -349,6 +369,33 @@ pub(crate) async fn start(
             .await
             .map_err(Into::into)
     }))
+}
+
+async fn get_admin_server_status(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin_session(&state, &headers).await?;
+    let counts = state.db.service_resource_counts().await.map_err(|error| {
+        log::error!("Failed to query service resource counts: {}", error);
+        ApiError::internal()
+    })?;
+    let online_devices = state.peer_map.online_count().await;
+    Ok(Json(json!({
+        "server_version": crate::version::VERSION,
+        "api_address": state.api_address.to_string(),
+        "rendezvous_address": state.rendezvous_address.to_string(),
+        "relay_servers": state.relay_servers,
+        "uptime_seconds": state.started_at.elapsed().as_secs(),
+        "resources": {
+            "total_users": counts.total_users,
+            "active_users": counts.active_users,
+            "total_devices": counts.total_devices,
+            "online_devices": online_devices,
+            "device_groups": counts.device_groups,
+            "user_groups": counts.user_groups,
+        },
+    })))
 }
 
 async fn bootstrap_admin(db: &Database) -> hbb_common::ResultType<()> {
@@ -3021,6 +3068,86 @@ mod tests {
     }
 
     #[test]
+    fn server_status_is_admin_only_and_reports_live_resource_counts() {
+        server_status_api_flow();
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    async fn server_status_api_flow() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(file.path().to_str().unwrap()).await.unwrap();
+        db.create_user(
+            "admin",
+            "Admin",
+            "admin@example.com",
+            &hash("admin-test-password", DEFAULT_COST).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        db.create_user(
+            "member",
+            "Member",
+            "member@example.com",
+            &hash("member-test-password", DEFAULT_COST).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        db.create_user_group("Operators", "").await.unwrap();
+        db.create_device_group("Workstations", "").await.unwrap();
+        db.insert_peer("known-device", b"device-uuid", b"device-key", "{}")
+            .await
+            .unwrap();
+        let peer_map = PeerMap::with_database(db.clone());
+        peer_map
+            .get_or("known-device")
+            .await
+            .write()
+            .await
+            .last_reg_time = Instant::now();
+        let state = ApiState {
+            db,
+            jwt_secret: "server-status-test-secret".to_owned(),
+            peer_map,
+            started_at: Instant::now(),
+            api_address: "0.0.0.0:21114".parse().unwrap(),
+            rendezvous_address: "0.0.0.0:21116".parse().unwrap(),
+            relay_servers: vec!["relay.example.test:21117".to_owned()],
+        };
+        let admin_headers = signed_test_headers(&state, "admin");
+        let member_headers = signed_test_headers(&state, "member");
+        assert_eq!(
+            get_admin_server_status(Extension(state.clone()), HeaderMap::new())
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_admin_server_status(Extension(state.clone()), member_headers)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let status = get_admin_server_status(Extension(state), admin_headers)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(status["api_address"], "0.0.0.0:21114");
+        assert_eq!(status["rendezvous_address"], "0.0.0.0:21116");
+        assert_eq!(status["relay_servers"], json!(["relay.example.test:21117"]));
+        assert_eq!(status["resources"]["total_users"], 2);
+        assert_eq!(status["resources"]["active_users"], 2);
+        assert_eq!(status["resources"]["total_devices"], 1);
+        assert_eq!(status["resources"]["online_devices"], 1);
+        assert_eq!(status["resources"]["device_groups"], 1);
+        assert_eq!(status["resources"]["user_groups"], 1);
+    }
+
+    #[test]
     fn delegated_roles_persist_and_enforce_group_scoped_access() {
         delegated_role_api_flow();
     }
@@ -3093,6 +3220,10 @@ mod tests {
             db: db.clone(),
             jwt_secret: "delegated-role-test-secret".to_owned(),
             peer_map: PeerMap::with_database(db.clone()),
+            started_at: Instant::now(),
+            api_address: "127.0.0.1:21114".parse().unwrap(),
+            rendezvous_address: "127.0.0.1:21116".parse().unwrap(),
+            relay_servers: Vec::new(),
         };
         let admin_headers = signed_test_headers(&state, "admin");
         let delegated_headers = signed_test_headers(&state, "delegate");
@@ -3529,6 +3660,10 @@ mod tests {
             db: db.clone(),
             jwt_secret: "user-group-test-secret".to_owned(),
             peer_map: PeerMap::with_database(db),
+            started_at: Instant::now(),
+            api_address: "127.0.0.1:21114".parse().unwrap(),
+            rendezvous_address: "127.0.0.1:21116".parse().unwrap(),
+            relay_servers: Vec::new(),
         };
         let admin_headers = test_auth_headers(&state, "admin");
 
@@ -3724,6 +3859,10 @@ mod tests {
             db: db.clone(),
             jwt_secret: "device-group-test-secret".to_owned(),
             peer_map: PeerMap::with_database(db),
+            started_at: Instant::now(),
+            api_address: "127.0.0.1:21114".parse().unwrap(),
+            rendezvous_address: "127.0.0.1:21116".parse().unwrap(),
+            relay_servers: Vec::new(),
         };
         let admin_headers = test_auth_headers(&state, "admin");
         let alice_headers = test_auth_headers(&state, "alice");
@@ -3913,6 +4052,10 @@ mod tests {
             db: db.clone(),
             jwt_secret: "api-token-test-secret".to_owned(),
             peer_map: PeerMap::with_database(db.clone()),
+            started_at: Instant::now(),
+            api_address: "127.0.0.1:21114".parse().unwrap(),
+            rendezvous_address: "127.0.0.1:21116".parse().unwrap(),
+            relay_servers: Vec::new(),
         };
         let admin_headers = test_auth_headers(&state, "admin");
         assert_eq!(
@@ -4111,6 +4254,10 @@ mod tests {
             db: db.clone(),
             jwt_secret: "personal-address-book-test-secret".to_owned(),
             peer_map: PeerMap::with_database(db.clone()),
+            started_at: Instant::now(),
+            api_address: "127.0.0.1:21114".parse().unwrap(),
+            rendezvous_address: "127.0.0.1:21116".parse().unwrap(),
+            relay_servers: Vec::new(),
         };
         let alice_headers = test_auth_headers(&state, "alice");
         let bob_headers = test_auth_headers(&state, "bob");
@@ -4329,6 +4476,10 @@ mod tests {
             db: db.clone(),
             jwt_secret: "address-book-test-secret".to_owned(),
             peer_map: PeerMap::with_database(db),
+            started_at: Instant::now(),
+            api_address: "127.0.0.1:21114".parse().unwrap(),
+            rendezvous_address: "127.0.0.1:21116".parse().unwrap(),
+            relay_servers: Vec::new(),
         };
         let admin_headers = test_auth_headers(&state, "admin");
         let alice_headers = test_auth_headers(&state, "alice");
@@ -4815,6 +4966,10 @@ mod tests {
             db: db.clone(),
             jwt_secret: "test-secret".to_owned(),
             peer_map,
+            started_at: Instant::now(),
+            api_address: "127.0.0.1:21114".parse().unwrap(),
+            rendezvous_address: "127.0.0.1:21116".parse().unwrap(),
+            relay_servers: Vec::new(),
         };
         let response = login(
             Extension(state.clone()),
@@ -5026,6 +5181,10 @@ mod tests {
             db: db.clone(),
             jwt_secret: "test-secret".to_owned(),
             peer_map: PeerMap::with_database(db.clone()),
+            started_at: Instant::now(),
+            api_address: "127.0.0.1:21114".parse().unwrap(),
+            rendezvous_address: "127.0.0.1:21116".parse().unwrap(),
+            relay_servers: Vec::new(),
         };
         db.insert_peer("admin-device", b"device-uuid", b"device-key", "{}")
             .await
