@@ -103,6 +103,18 @@ pub struct AddressBookPermission {
     pub access: String,
 }
 
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+pub struct AuditLog {
+    pub id: i64,
+    pub actor_id: i64,
+    pub actor_name: String,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub summary: String,
+    pub created_at: String,
+}
+
 impl Database {
     pub async fn new(url: &str) -> ResultType<Database> {
         if !std::path::Path::new(url).exists() {
@@ -216,7 +228,21 @@ impl Database {
                 primary key (book_id, subject_type, subject_id)
             );
             create index if not exists index_address_book_permissions_subject
-                on address_book_permissions (subject_type, subject_id);",
+                on address_book_permissions (subject_type, subject_id);
+            create table if not exists admin_audit_logs (
+                id integer primary key autoincrement,
+                actor_id integer not null,
+                actor_name varchar(64) not null,
+                action varchar(40) not null,
+                resource_type varchar(40) not null,
+                resource_id varchar(200) not null,
+                summary varchar(300) not null,
+                created_at datetime not null default(current_timestamp)
+            );
+            create index if not exists index_admin_audit_logs_created_at
+                on admin_audit_logs (created_at);
+            create index if not exists index_admin_audit_logs_actor
+                on admin_audit_logs (actor_name, created_at);",
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
@@ -1024,6 +1050,84 @@ impl Database {
         }
         tx.commit().await?;
         Ok(true)
+    }
+
+    pub async fn insert_admin_audit_log(
+        &self,
+        actor_id: i64,
+        actor_name: &str,
+        action: &str,
+        resource_type: &str,
+        resource_id: &str,
+        summary: &str,
+    ) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        sqlx::query(
+            "insert into admin_audit_logs \
+             (actor_id, actor_name, action, resource_type, resource_id, summary) \
+             values (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(actor_id)
+        .bind(actor_name)
+        .bind(action)
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(summary)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "delete from admin_audit_logs \
+             where id not in (select id from admin_audit_logs order by id desc limit 100000)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_admin_audit_logs(
+        &self,
+        actor: Option<&str>,
+        action: Option<&str>,
+        resource_type: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<AuditLog>, i64)> {
+        let mut conn = self.pool.get().await?;
+        let logs = sqlx::query_as::<_, AuditLog>(
+            "select id, actor_id, actor_name, action, resource_type, resource_id, summary, created_at \
+             from admin_audit_logs \
+             where (? is null or actor_name = ?) \
+               and (? is null or action = ?) \
+               and (? is null or resource_type = ?) \
+             order by id desc limit ? offset ?",
+        )
+        .bind(actor)
+        .bind(actor)
+        .bind(action)
+        .bind(action)
+        .bind(resource_type)
+        .bind(resource_type)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        let total = sqlx::query_scalar(
+            "select count(*) from admin_audit_logs \
+             where (? is null or actor_name = ?) \
+               and (? is null or action = ?) \
+               and (? is null or resource_type = ?)",
+        )
+        .bind(actor)
+        .bind(actor)
+        .bind(action)
+        .bind(action)
+        .bind(resource_type)
+        .bind(resource_type)
+        .fetch_one(conn.deref_mut())
+        .await?;
+        Ok((logs, total))
     }
 
     pub async fn get_or_create_api_secret(&self) -> ResultType<String> {

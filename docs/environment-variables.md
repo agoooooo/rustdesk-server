@@ -98,6 +98,12 @@ connection authorization based on account ownership. Ownership controls device
 inventory visibility only; it does not replace the target device's password,
 confirmation, or unattended-access settings.
 
+Successful management changes to users, devices, groups, and shared address
+books are recorded in an administrator-readable operation log. This records
+action and resource identifiers, not passwords, tokens, notes, or full request
+bodies. The log keeps the newest 100,000 entries. Connection sessions, file
+transfers, alerts, and failed requests are not included.
+
 Relevant endpoints:
 
 | Endpoint | Access | Purpose |
@@ -120,6 +126,7 @@ Relevant endpoints:
 | `/api/admin/address-books` | Administrator | Create, list, update, and delete shared address books. |
 | `/api/admin/address-books/:id` | Administrator | Update or delete a shared address book. |
 | `/api/admin/users` | Administrator | Create, update, list, and delete accounts. |
+| `GET /api/admin/audit-logs` | Administrator | List successful management mutations; supports `current`, `pageSize`, `actor`, `action`, and `resourceType` filters. |
 
 The API defaults to loopback because it serves password-based login over HTTP.
 For remote use, configure an HTTPS reverse proxy and point clients to its API

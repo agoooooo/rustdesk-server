@@ -91,6 +91,16 @@ struct Pagination {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditLogQuery {
+    current: Option<i64>,
+    page_size: Option<i64>,
+    actor: Option<String>,
+    action: Option<String>,
+    resource_type: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct CreateUser {
     name: String,
     email: String,
@@ -274,6 +284,7 @@ pub(crate) async fn start(
         )
         .route("/api/admin/users", get(list_admin_users).post(create_user))
         .route("/api/admin/users/:id", put(update_user).delete(delete_user))
+        .route("/api/admin/audit-logs", get(list_admin_audit_logs))
         .layer(Extension(state))
         .layer(CorsLayer::permissive());
     let address = SocketAddr::new(bind_addr.unwrap_or(IpAddr::from([0, 0, 0, 0])), port);
@@ -547,13 +558,22 @@ async fn create_device_group(
     headers: HeaderMap,
     Json(request): Json<CreateDeviceGroup>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     validate_device_group(&request.name, &request.description)?;
     let id = state
         .db
         .create_device_group(request.name.trim(), request.description.trim())
         .await
         .map_err(device_group_write_error)?;
+    record_admin_audit(
+        &state,
+        &actor,
+        "create",
+        "device_group",
+        &id.to_string(),
+        "Created device group",
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -571,7 +591,7 @@ async fn update_device_group(
     Path(id): Path<i64>,
     Json(request): Json<UpdateDeviceGroup>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     validate_device_group(&request.name, &request.description)?;
     let updated = state
         .db
@@ -584,6 +604,15 @@ async fn update_device_group(
             "Device group not found",
         ));
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "update",
+        "device_group",
+        &id.to_string(),
+        "Updated device group",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -592,7 +621,7 @@ async fn delete_device_group(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     let deleted = state.db.delete_device_group(id).await.map_err(|error| {
         log::error!("Failed to delete device group: {}", error);
         ApiError::internal()
@@ -603,6 +632,15 @@ async fn delete_device_group(
             "Device group not found",
         ));
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "delete",
+        "device_group",
+        &id.to_string(),
+        "Deleted device group",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -630,7 +668,7 @@ async fn update_device_group_peers(
     Path(id): Path<i64>,
     Json(request): Json<UpdateDeviceGroupPeers>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     if request.device_ids.len() > 2000 {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -675,6 +713,15 @@ async fn update_device_group_peers(
             "Device group not found",
         ));
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "replace_members",
+        "device_group",
+        &id.to_string(),
+        "Replaced device group devices",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -758,13 +805,22 @@ async fn create_user_group(
     headers: HeaderMap,
     Json(request): Json<CreateUserGroup>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     validate_user_group(&request.name, &request.description)?;
     let id = state
         .db
         .create_user_group(request.name.trim(), request.description.trim())
         .await
         .map_err(user_group_write_error)?;
+    record_admin_audit(
+        &state,
+        &actor,
+        "create",
+        "user_group",
+        &id.to_string(),
+        "Created user group",
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -782,7 +838,7 @@ async fn update_user_group(
     Path(id): Path<i64>,
     Json(request): Json<UpdateUserGroup>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     validate_user_group(&request.name, &request.description)?;
     let updated = state
         .db
@@ -792,6 +848,15 @@ async fn update_user_group(
     if !updated {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "User group not found"));
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "update",
+        "user_group",
+        &id.to_string(),
+        "Updated user group",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -800,7 +865,7 @@ async fn delete_user_group(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     let deleted = state.db.delete_user_group(id).await.map_err(|error| {
         log::error!("Failed to delete user group: {}", error);
         ApiError::internal()
@@ -808,6 +873,15 @@ async fn delete_user_group(
     if !deleted {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "User group not found"));
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "delete",
+        "user_group",
+        &id.to_string(),
+        "Deleted user group",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -835,7 +909,7 @@ async fn update_user_group_members(
     Path(id): Path<i64>,
     Json(request): Json<UpdateUserGroupMembers>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     if request.user_ids.len() > 2000 {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -877,6 +951,15 @@ async fn update_user_group_members(
     if !updated {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "User group not found"));
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "replace_members",
+        "user_group",
+        &id.to_string(),
+        "Replaced user group members",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -966,13 +1049,22 @@ async fn create_address_book(
     headers: HeaderMap,
     Json(request): Json<AddressBookRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     validate_address_book(&request.name, &request.description)?;
     let id = state
         .db
         .create_address_book(request.name.trim(), request.description.trim())
         .await
         .map_err(address_book_write_error)?;
+    record_admin_audit(
+        &state,
+        &actor,
+        "create",
+        "address_book",
+        &id.to_string(),
+        "Created shared address book",
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -991,7 +1083,7 @@ async fn update_address_book(
     Path(id): Path<i64>,
     Json(request): Json<AddressBookRequest>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     validate_address_book(&request.name, &request.description)?;
     let updated = state
         .db
@@ -1004,6 +1096,15 @@ async fn update_address_book(
             "Address book not found",
         ));
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "update",
+        "address_book",
+        &id.to_string(),
+        "Updated shared address book",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1012,7 +1113,7 @@ async fn delete_address_book(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     let deleted = state.db.delete_address_book(id).await.map_err(|error| {
         log::error!("Failed to delete address book: {}", error);
         ApiError::internal()
@@ -1023,6 +1124,15 @@ async fn delete_address_book(
             "Address book not found",
         ));
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "delete",
+        "address_book",
+        &id.to_string(),
+        "Deleted shared address book",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1067,7 +1177,7 @@ async fn create_address_book_entry(
     Path(id): Path<i64>,
     Json(request): Json<AddressBookEntryRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_address_book_access(&state, &headers, id, "write").await?;
+    let actor = require_address_book_access(&state, &headers, id, "write").await?;
     let tags = validate_address_book_entry(&request)?;
     let entry_id = state
         .db
@@ -1081,6 +1191,15 @@ async fn create_address_book_entry(
         .await
         .map_err(address_book_write_error)?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Address book not found"))?;
+    record_admin_audit(
+        &state,
+        &actor,
+        "create",
+        "address_book_entry",
+        &entry_id.to_string(),
+        "Created address book entry",
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -1099,7 +1218,7 @@ async fn update_address_book_entry(
     Path((id, entry_id)): Path<(i64, i64)>,
     Json(request): Json<AddressBookEntryRequest>,
 ) -> Result<StatusCode, ApiError> {
-    require_address_book_access(&state, &headers, id, "write").await?;
+    let actor = require_address_book_access(&state, &headers, id, "write").await?;
     let tags = validate_address_book_entry(&request)?;
     let updated = state
         .db
@@ -1119,6 +1238,15 @@ async fn update_address_book_entry(
             "Address book entry not found",
         ));
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "update",
+        "address_book_entry",
+        &entry_id.to_string(),
+        "Updated address book entry",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1127,7 +1255,7 @@ async fn delete_address_book_entry(
     headers: HeaderMap,
     Path((id, entry_id)): Path<(i64, i64)>,
 ) -> Result<StatusCode, ApiError> {
-    require_address_book_access(&state, &headers, id, "write").await?;
+    let actor = require_address_book_access(&state, &headers, id, "write").await?;
     let deleted = state
         .db
         .delete_address_book_entry(id, entry_id)
@@ -1142,6 +1270,15 @@ async fn delete_address_book_entry(
             "Address book entry not found",
         ));
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "delete",
+        "address_book_entry",
+        &entry_id.to_string(),
+        "Deleted address book entry",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1169,7 +1306,7 @@ async fn update_address_book_permissions(
     Path(id): Path<i64>,
     Json(request): Json<AddressBookPermissionsRequest>,
 ) -> Result<StatusCode, ApiError> {
-    require_address_book_access(&state, &headers, id, "manage").await?;
+    let actor = require_address_book_access(&state, &headers, id, "manage").await?;
     if request.permissions.len() > 2000 {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -1244,6 +1381,15 @@ async fn update_address_book_permissions(
             "Address book not found",
         ));
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "replace_permissions",
+        "address_book",
+        &id.to_string(),
+        "Replaced address book sharing permissions",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1366,6 +1512,52 @@ async fn list_admin_peers(
     peers_response(&state.db, &state.peer_map, query, None).await
 }
 
+async fn list_admin_audit_logs(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditLogQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let actor = query
+        .actor
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let action = query
+        .action
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let resource_type = query
+        .resource_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if actor.is_some_and(|value| value.len() > 64)
+        || action.is_some_and(|value| !valid_audit_action(value))
+        || resource_type.is_some_and(|value| !valid_audit_resource_type(value))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid audit log filter",
+        ));
+    }
+    let current = query.current.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 200);
+    let offset = current.saturating_sub(1).saturating_mul(page_size);
+    let (logs, total) = state
+        .db
+        .list_admin_audit_logs(actor, action, resource_type, page_size, offset)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list administrator audit logs: {}", error);
+            ApiError::internal()
+        })?;
+    Ok(Json(
+        json!({ "total": total, "data": logs, "current": current }),
+    ))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdatePeer {
@@ -1381,7 +1573,7 @@ async fn update_peer(
     Path(id): Path<String>,
     Json(request): Json<UpdatePeer>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     if id.trim().is_empty() || id.len() > crate::peer::MAX_PEER_ID_LEN {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Invalid device ID"));
     }
@@ -1418,6 +1610,15 @@ async fn update_peer(
     if !updated {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "Device not found"));
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "update",
+        "device",
+        &id,
+        "Updated device owner or note",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1470,7 +1671,7 @@ async fn create_user(
     headers: HeaderMap,
     Json(request): Json<CreateUser>,
 ) -> Result<(StatusCode, Json<UserPayload>), ApiError> {
-    require_admin(&state, &headers).await?;
+    let actor = require_admin(&state, &headers).await?;
     validate_name(&request.name)?;
     validate_email(&request.email)?;
     validate_password(&request.password)?;
@@ -1489,6 +1690,15 @@ async fn create_user(
         )
         .await
         .map_err(database_write_error)?;
+    record_admin_audit(
+        &state,
+        &actor,
+        "create",
+        "user",
+        &id.to_string(),
+        "Created user account",
+    )
+    .await?;
     let user = state
         .db
         .get_user_by_id(id)
@@ -1564,6 +1774,15 @@ async fn update_user(
             .await
             .map_err(database_write_error)?;
     }
+    record_admin_audit(
+        &state,
+        &actor,
+        "update",
+        "user",
+        &id.to_string(),
+        "Updated user account",
+    )
+    .await?;
     let user = state
         .db
         .get_user_by_id(id)
@@ -1610,6 +1829,15 @@ async fn delete_user(
         .delete_user(id)
         .await
         .map_err(database_write_error)?;
+    record_admin_audit(
+        &state,
+        &actor,
+        "delete",
+        "user",
+        &id.to_string(),
+        "Deleted user account",
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1619,6 +1847,51 @@ async fn require_admin(state: &ApiState, headers: &HeaderMap) -> Result<User, Ap
         return Err(ApiError::new(StatusCode::FORBIDDEN, "Admin required!"));
     }
     Ok(user)
+}
+
+async fn record_admin_audit(
+    state: &ApiState,
+    actor: &User,
+    action: &str,
+    resource_type: &str,
+    resource_id: &str,
+    summary: &str,
+) -> Result<(), ApiError> {
+    state
+        .db
+        .insert_admin_audit_log(
+            actor.id,
+            &actor.name,
+            action,
+            resource_type,
+            resource_id,
+            summary,
+        )
+        .await
+        .map_err(|error| {
+            log::error!(
+                "Failed to record admin audit action '{}' on {} {}: {}",
+                action,
+                resource_type,
+                resource_id,
+                error
+            );
+            ApiError::internal()
+        })
+}
+
+fn valid_audit_action(action: &str) -> bool {
+    matches!(
+        action,
+        "create" | "update" | "delete" | "replace_members" | "replace_permissions"
+    )
+}
+
+fn valid_audit_resource_type(resource_type: &str) -> bool {
+    matches!(
+        resource_type,
+        "user" | "device" | "device_group" | "user_group" | "address_book" | "address_book_entry"
+    )
 }
 
 async fn authenticated_user(state: &ApiState, headers: &HeaderMap) -> Result<User, ApiError> {
@@ -2209,6 +2482,57 @@ mod tests {
         .unwrap();
         assert_eq!(status, StatusCode::CREATED);
         let book_id = book["id"].as_i64().unwrap();
+        assert_eq!(
+            list_admin_audit_logs(
+                Extension(state.clone()),
+                admin_headers.clone(),
+                Query(AuditLogQuery {
+                    current: Some(1),
+                    page_size: Some(20),
+                    actor: Some("admin".to_owned()),
+                    action: Some("create".to_owned()),
+                    resource_type: Some("address_book".to_owned()),
+                }),
+            )
+            .await
+            .unwrap()
+            .0["data"][0]["summary"],
+            "Created shared address book"
+        );
+        assert_eq!(
+            list_admin_audit_logs(
+                Extension(state.clone()),
+                test_auth_headers(&state, "alice"),
+                Query(AuditLogQuery {
+                    current: Some(1),
+                    page_size: Some(20),
+                    actor: None,
+                    action: None,
+                    resource_type: None,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            list_admin_audit_logs(
+                Extension(state.clone()),
+                admin_headers.clone(),
+                Query(AuditLogQuery {
+                    current: Some(1),
+                    page_size: Some(20),
+                    actor: None,
+                    action: Some("invalid".to_owned()),
+                    resource_type: None,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
         assert_eq!(
             list_accessible_address_books(
                 Extension(state.clone()),
