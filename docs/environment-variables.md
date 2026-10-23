@@ -84,9 +84,18 @@ containing devices owned by that account; group membership does not grant
 connection access. User groups can also be created and managed by
 administrators, with active users assigned as members. Authenticated users can
 list their own groups; this membership currently does not grant access to
-devices or other group members' resources. The API does not enforce connection
-authorization based on account ownership. Ownership controls device inventory
-visibility only; it does not replace the target device's password,
+devices or other group members' resources.
+
+Administrators can create shared address books, manage device ID entries, and
+assign `read`, `write`, or `manage` permissions to users, user groups, or all
+authenticated users. Group permissions are inherited by active group members;
+the strongest matching permission applies. `write` allows entry CRUD, while
+`manage` also allows changing address-book permissions. Administrators retain
+access to every address book. These permissions only control address-book data;
+they do not grant RustDesk connection access. Personal address books and
+connection authorization are not implemented. The API does not enforce
+connection authorization based on account ownership. Ownership controls device
+inventory visibility only; it does not replace the target device's password,
 confirmation, or unattended-access settings.
 
 Relevant endpoints:
@@ -103,6 +112,13 @@ Relevant endpoints:
 | `GET /api/user-group/accessible` | Authenticated | List user groups of which the current account is a member. |
 | `/api/admin/user-groups` | Administrator | Create, list, update, and delete user groups. |
 | `/api/admin/user-groups/:id/users` | Administrator | Read or replace group membership; JSON body: `{"user_ids":[1,2]}`. Only active users can be assigned. |
+| `GET /api/address-books` | Authenticated | List address books accessible to the current account; administrators see all books. |
+| `GET /api/address-books/:id/entries` | Read permission | List device ID entries. |
+| `POST /api/address-books/:id/entries` | Write permission | Add an entry; tags are a JSON string array. |
+| `PUT`, `DELETE /api/address-books/:id/entries/:entry_id` | Write permission | Edit or remove an entry. |
+| `GET`, `PUT /api/address-books/:id/permissions` | Manage permission | Read or replace sharing rules; JSON body: `{"permissions":[{"subject_type":"group","subject_id":1,"access":"read"}]}`. |
+| `/api/admin/address-books` | Administrator | Create, list, update, and delete shared address books. |
+| `/api/admin/address-books/:id` | Administrator | Update or delete a shared address book. |
 | `/api/admin/users` | Administrator | Create, update, list, and delete accounts. |
 
 The API defaults to loopback because it serves password-based login over HTTP.

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use hbb_common::{log, ResultType};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{
     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
 };
@@ -76,6 +76,31 @@ pub struct UserGroup {
     pub name: String,
     pub description: String,
     pub member_count: i64,
+}
+
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+pub struct AddressBook {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub permission: String,
+    pub entry_count: i64,
+}
+
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+pub struct AddressBookEntry {
+    pub id: i64,
+    pub device_id: String,
+    pub alias: String,
+    pub note: String,
+    pub tags: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AddressBookPermission {
+    pub subject_type: String,
+    pub subject_id: i64,
+    pub access: String,
 }
 
 impl Database {
@@ -165,7 +190,33 @@ impl Database {
                 primary key (group_id, user_id)
             );
             create index if not exists index_user_group_members_user_id
-                on user_group_members (user_id);",
+                on user_group_members (user_id);
+            create table if not exists address_books (
+                id integer primary key autoincrement,
+                name varchar(100) not null collate nocase unique,
+                description varchar(300) not null default '',
+                created_at datetime not null default(current_timestamp)
+            );
+            create table if not exists address_book_entries (
+                id integer primary key autoincrement,
+                book_id integer not null,
+                device_id varchar(100) not null,
+                alias varchar(100) not null default '',
+                note varchar(300) not null default '',
+                tags text not null default '[]',
+                unique (book_id, device_id)
+            );
+            create index if not exists index_address_book_entries_book_id
+                on address_book_entries (book_id);
+            create table if not exists address_book_permissions (
+                book_id integer not null,
+                subject_type varchar(20) not null,
+                subject_id integer not null default 0,
+                access varchar(20) not null,
+                primary key (book_id, subject_type, subject_id)
+            );
+            create index if not exists index_address_book_permissions_subject
+                on address_book_permissions (subject_type, subject_id);",
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
@@ -700,6 +751,279 @@ impl Database {
         .fetch_one(conn.deref_mut())
         .await?;
         Ok((groups, total))
+    }
+
+    pub async fn list_address_books(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<AddressBook>, i64)> {
+        let mut conn = self.pool.get().await?;
+        let books = sqlx::query_as::<_, AddressBook>(
+            "select b.id, b.name, b.description, 'manage' as permission, \
+             count(e.id) as entry_count \
+             from address_books b left join address_book_entries e on e.book_id = b.id \
+             group by b.id order by b.name collate nocase limit ? offset ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        let total = sqlx::query_scalar("select count(*) from address_books")
+            .fetch_one(conn.deref_mut())
+            .await?;
+        Ok((books, total))
+    }
+
+    pub async fn list_accessible_address_books(
+        &self,
+        user_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<AddressBook>, i64)> {
+        let mut conn = self.pool.get().await?;
+        let books = sqlx::query_as::<_, AddressBook>(
+            "select b.id, b.name, b.description, \
+             case max(case ap.access when 'manage' then 3 when 'write' then 2 when 'read' then 1 else 0 end) \
+               when 3 then 'manage' when 2 then 'write' else 'read' end as permission, \
+             count(distinct e.id) as entry_count \
+             from address_books b \
+             join address_book_permissions ap on ap.book_id = b.id \
+             left join user_group_members gm on ap.subject_type = 'group' \
+               and gm.group_id = ap.subject_id and gm.user_id = ? \
+             left join address_book_entries e on e.book_id = b.id \
+             where (ap.subject_type = 'everyone' and ap.subject_id = 0) \
+               or (ap.subject_type = 'user' and ap.subject_id = ?) \
+               or (ap.subject_type = 'group' and gm.user_id = ?) \
+             group by b.id order by b.name collate nocase limit ? offset ?",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        let total = sqlx::query_scalar(
+            "select count(distinct b.id) from address_books b \
+             join address_book_permissions ap on ap.book_id = b.id \
+             left join user_group_members gm on ap.subject_type = 'group' \
+               and gm.group_id = ap.subject_id and gm.user_id = ? \
+             where (ap.subject_type = 'everyone' and ap.subject_id = 0) \
+               or (ap.subject_type = 'user' and ap.subject_id = ?) \
+               or (ap.subject_type = 'group' and gm.user_id = ?)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_one(conn.deref_mut())
+        .await?;
+        Ok((books, total))
+    }
+
+    pub async fn address_book_permission(
+        &self,
+        book_id: i64,
+        user_id: i64,
+    ) -> ResultType<Option<String>> {
+        let permission = sqlx::query_scalar::<_, String>(
+            "select case max(case ap.access when 'manage' then 3 when 'write' then 2 when 'read' then 1 else 0 end) \
+             when 3 then 'manage' when 2 then 'write' when 1 then 'read' else '' end \
+             from address_book_permissions ap \
+             left join user_group_members gm on ap.subject_type = 'group' \
+               and gm.group_id = ap.subject_id and gm.user_id = ? \
+             where ap.book_id = ? and ( \
+               (ap.subject_type = 'everyone' and ap.subject_id = 0) \
+               or (ap.subject_type = 'user' and ap.subject_id = ?) \
+               or (ap.subject_type = 'group' and gm.user_id = ?))",
+        )
+        .bind(user_id)
+        .bind(book_id)
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_one(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok((!permission.is_empty()).then_some(permission))
+    }
+
+    pub async fn create_address_book(&self, name: &str, description: &str) -> ResultType<i64> {
+        let result = sqlx::query("insert into address_books(name, description) values(?, ?)")
+            .bind(name)
+            .bind(description)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn update_address_book(
+        &self,
+        id: i64,
+        name: &str,
+        description: &str,
+    ) -> ResultType<bool> {
+        let result = sqlx::query("update address_books set name = ?, description = ? where id = ?")
+            .bind(name)
+            .bind(description)
+            .bind(id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delete_address_book(&self, id: i64) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let result = sqlx::query("delete from address_books where id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 1 {
+            sqlx::query("delete from address_book_entries where book_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("delete from address_book_permissions where book_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn list_address_book_entries(
+        &self,
+        book_id: i64,
+    ) -> ResultType<Option<Vec<AddressBookEntry>>> {
+        let mut conn = self.pool.get().await?;
+        let exists: Option<i64> = sqlx::query_scalar("select id from address_books where id = ?")
+            .bind(book_id)
+            .fetch_optional(conn.deref_mut())
+            .await?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+        let entries = sqlx::query_as::<_, AddressBookEntry>(
+            "select id, device_id, alias, note, tags from address_book_entries \
+             where book_id = ? order by alias collate nocase, device_id",
+        )
+        .bind(book_id)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        Ok(Some(entries))
+    }
+
+    pub async fn create_address_book_entry(
+        &self,
+        book_id: i64,
+        device_id: &str,
+        alias: &str,
+        note: &str,
+        tags: &str,
+    ) -> ResultType<Option<i64>> {
+        let result = sqlx::query(
+            "insert into address_book_entries(book_id, device_id, alias, note, tags) \
+             select ?, ?, ?, ?, ? where exists(select 1 from address_books where id = ?)",
+        )
+        .bind(book_id)
+        .bind(device_id)
+        .bind(alias)
+        .bind(note)
+        .bind(tags)
+        .bind(book_id)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok((result.rows_affected() == 1).then_some(result.last_insert_rowid()))
+    }
+
+    pub async fn update_address_book_entry(
+        &self,
+        book_id: i64,
+        entry_id: i64,
+        device_id: &str,
+        alias: &str,
+        note: &str,
+        tags: &str,
+    ) -> ResultType<bool> {
+        let result = sqlx::query(
+            "update address_book_entries set device_id = ?, alias = ?, note = ?, tags = ? \
+             where id = ? and book_id = ?",
+        )
+        .bind(device_id)
+        .bind(alias)
+        .bind(note)
+        .bind(tags)
+        .bind(entry_id)
+        .bind(book_id)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delete_address_book_entry(&self, book_id: i64, entry_id: i64) -> ResultType<bool> {
+        let result = sqlx::query("delete from address_book_entries where id = ? and book_id = ?")
+            .bind(entry_id)
+            .bind(book_id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn list_address_book_permissions(
+        &self,
+        book_id: i64,
+    ) -> ResultType<Option<Vec<AddressBookPermission>>> {
+        let mut conn = self.pool.get().await?;
+        let exists: Option<i64> = sqlx::query_scalar("select id from address_books where id = ?")
+            .bind(book_id)
+            .fetch_optional(conn.deref_mut())
+            .await?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+        let permissions = sqlx::query_as::<_, AddressBookPermission>(
+            "select subject_type, subject_id, access from address_book_permissions \
+             where book_id = ? order by subject_type, subject_id",
+        )
+        .bind(book_id)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        Ok(Some(permissions))
+    }
+
+    pub async fn set_address_book_permissions(
+        &self,
+        book_id: i64,
+        permissions: &[AddressBookPermission],
+    ) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let exists: Option<i64> = sqlx::query_scalar("select id from address_books where id = ?")
+            .bind(book_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("delete from address_book_permissions where book_id = ?")
+            .bind(book_id)
+            .execute(&mut *tx)
+            .await?;
+        for permission in permissions {
+            sqlx::query(
+                "insert into address_book_permissions(book_id, subject_type, subject_id, access) \
+                 values(?, ?, ?, ?)",
+            )
+            .bind(book_id)
+            .bind(&permission.subject_type)
+            .bind(permission.subject_id)
+            .bind(&permission.access)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn get_or_create_api_secret(&self) -> ResultType<String> {

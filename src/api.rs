@@ -1,6 +1,6 @@
 use crate::{
     common::get_arg_opt,
-    database::{Database, User},
+    database::{AddressBookPermission, Database, User},
     peer::PeerMap,
 };
 use axum::{
@@ -150,6 +150,29 @@ struct UpdateUserGroupMembers {
     user_ids: Vec<i64>,
 }
 
+#[derive(Deserialize)]
+struct AddressBookRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct AddressBookEntryRequest {
+    device_id: String,
+    #[serde(default)]
+    alias: String,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct AddressBookPermissionsRequest {
+    permissions: Vec<AddressBookPermission>,
+}
+
 #[derive(Serialize)]
 struct UserPayload {
     id: i64,
@@ -227,6 +250,27 @@ pub(crate) async fn start(
         .route(
             "/api/admin/user-groups/:id/users",
             get(list_user_group_members).put(update_user_group_members),
+        )
+        .route("/api/address-books", get(list_accessible_address_books))
+        .route(
+            "/api/address-books/:id/entries",
+            get(list_accessible_address_book_entries).post(create_address_book_entry),
+        )
+        .route(
+            "/api/address-books/:id/entries/:entry_id",
+            put(update_address_book_entry).delete(delete_address_book_entry),
+        )
+        .route(
+            "/api/address-books/:id/permissions",
+            get(list_address_book_permissions).put(update_address_book_permissions),
+        )
+        .route(
+            "/api/admin/address-books",
+            get(list_admin_address_books).post(create_address_book),
+        )
+        .route(
+            "/api/admin/address-books/:id",
+            put(update_address_book).delete(delete_address_book),
         )
         .route("/api/admin/users", get(list_admin_users).post(create_user))
         .route("/api/admin/users/:id", put(update_user).delete(delete_user))
@@ -806,7 +850,7 @@ async fn update_user_group_members(
                 "Invalid or duplicate user ID",
             ));
         }
-        let active = state
+        let exists = state
             .db
             .get_user_by_id(*user_id)
             .await
@@ -815,7 +859,7 @@ async fn update_user_group_members(
                 ApiError::internal()
             })?
             .is_some_and(|user| user.status == 1);
-        if !active {
+        if !exists {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "Active user not found",
@@ -862,6 +906,454 @@ fn user_group_write_error(error: hbb_common::anyhow::Error) -> ApiError {
         }
     }
     log::error!("Failed to save user group: {}", error);
+    ApiError::internal()
+}
+
+async fn list_accessible_address_books(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<Pagination>,
+) -> Result<Json<Value>, ApiError> {
+    let user = authenticated_user(&state, &headers).await?;
+    let current = query.current.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
+    let offset = current.saturating_sub(1).saturating_mul(page_size);
+    let listing = if user.is_admin {
+        state.db.list_address_books(page_size, offset).await
+    } else {
+        state
+            .db
+            .list_accessible_address_books(user.id, page_size, offset)
+            .await
+    };
+    let (books, total) = listing.map_err(|error| {
+        log::error!("Failed to list accessible address books: {}", error);
+        ApiError::internal()
+    })?;
+    Ok(Json(json!({
+        "total": total,
+        "data": books,
+        "current": current,
+    })))
+}
+
+async fn list_admin_address_books(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<Pagination>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let current = query.current.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
+    let offset = current.saturating_sub(1).saturating_mul(page_size);
+    let (books, total) = state
+        .db
+        .list_address_books(page_size, offset)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list address books: {}", error);
+            ApiError::internal()
+        })?;
+    Ok(Json(json!({
+        "total": total,
+        "data": books,
+        "current": current,
+    })))
+}
+
+async fn create_address_book(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<AddressBookRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_admin(&state, &headers).await?;
+    validate_address_book(&request.name, &request.description)?;
+    let id = state
+        .db
+        .create_address_book(request.name.trim(), request.description.trim())
+        .await
+        .map_err(address_book_write_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": id,
+            "name": request.name.trim(),
+            "description": request.description.trim(),
+            "permission": "manage",
+            "entry_count": 0,
+        })),
+    ))
+}
+
+async fn update_address_book(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(request): Json<AddressBookRequest>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers).await?;
+    validate_address_book(&request.name, &request.description)?;
+    let updated = state
+        .db
+        .update_address_book(id, request.name.trim(), request.description.trim())
+        .await
+        .map_err(address_book_write_error)?;
+    if !updated {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Address book not found",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_address_book(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers).await?;
+    let deleted = state.db.delete_address_book(id).await.map_err(|error| {
+        log::error!("Failed to delete address book: {}", error);
+        ApiError::internal()
+    })?;
+    if !deleted {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Address book not found",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_accessible_address_book_entries(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    require_address_book_access(&state, &headers, id, "read").await?;
+    address_book_entries_response(&state.db, id).await
+}
+
+async fn address_book_entries_response(db: &Database, id: i64) -> Result<Json<Value>, ApiError> {
+    let entries = db
+        .list_address_book_entries(id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list address book entries: {}", error);
+            ApiError::internal()
+        })?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Address book not found"))?;
+    let mut data = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let tags = serde_json::from_str::<Vec<String>>(&entry.tags).map_err(|error| {
+            log::error!("Failed to decode address book tags: {}", error);
+            ApiError::internal()
+        })?;
+        data.push(json!({
+            "id": entry.id,
+            "device_id": entry.device_id,
+            "alias": entry.alias,
+            "note": entry.note,
+            "tags": tags,
+        }));
+    }
+    Ok(Json(json!({ "data": data })))
+}
+
+async fn create_address_book_entry(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(request): Json<AddressBookEntryRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_address_book_access(&state, &headers, id, "write").await?;
+    let tags = validate_address_book_entry(&request)?;
+    let entry_id = state
+        .db
+        .create_address_book_entry(
+            id,
+            request.device_id.trim(),
+            request.alias.trim(),
+            request.note.trim(),
+            &tags,
+        )
+        .await
+        .map_err(address_book_write_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Address book not found"))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": entry_id,
+            "device_id": request.device_id.trim(),
+            "alias": request.alias.trim(),
+            "note": request.note.trim(),
+            "tags": request.tags,
+        })),
+    ))
+}
+
+async fn update_address_book_entry(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path((id, entry_id)): Path<(i64, i64)>,
+    Json(request): Json<AddressBookEntryRequest>,
+) -> Result<StatusCode, ApiError> {
+    require_address_book_access(&state, &headers, id, "write").await?;
+    let tags = validate_address_book_entry(&request)?;
+    let updated = state
+        .db
+        .update_address_book_entry(
+            id,
+            entry_id,
+            request.device_id.trim(),
+            request.alias.trim(),
+            request.note.trim(),
+            &tags,
+        )
+        .await
+        .map_err(address_book_write_error)?;
+    if !updated {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Address book entry not found",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_address_book_entry(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path((id, entry_id)): Path<(i64, i64)>,
+) -> Result<StatusCode, ApiError> {
+    require_address_book_access(&state, &headers, id, "write").await?;
+    let deleted = state
+        .db
+        .delete_address_book_entry(id, entry_id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to delete address book entry: {}", error);
+            ApiError::internal()
+        })?;
+    if !deleted {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Address book entry not found",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_address_book_permissions(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    require_address_book_access(&state, &headers, id, "manage").await?;
+    let permissions = state
+        .db
+        .list_address_book_permissions(id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list address book permissions: {}", error);
+            ApiError::internal()
+        })?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Address book not found"))?;
+    Ok(Json(json!({ "permissions": permissions })))
+}
+
+async fn update_address_book_permissions(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(request): Json<AddressBookPermissionsRequest>,
+) -> Result<StatusCode, ApiError> {
+    require_address_book_access(&state, &headers, id, "manage").await?;
+    if request.permissions.len() > 2000 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "An address book can have at most 2000 permission rules",
+        ));
+    }
+    let mut subjects = HashSet::with_capacity(request.permissions.len());
+    for permission in &request.permissions {
+        if !matches!(permission.access.as_str(), "read" | "write" | "manage")
+            || !subjects.insert((permission.subject_type.as_str(), permission.subject_id))
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Invalid or duplicate address book permission",
+            ));
+        }
+        match permission.subject_type.as_str() {
+            "everyone" if permission.subject_id == 0 => {}
+            "user" if permission.subject_id > 0 => {
+                let active = state
+                    .db
+                    .get_user_by_id(permission.subject_id)
+                    .await
+                    .map_err(|error| {
+                        log::error!("Failed to validate address book user: {}", error);
+                        ApiError::internal()
+                    })?
+                    .is_some();
+                if !active {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "Active user not found",
+                    ));
+                }
+            }
+            "group" if permission.subject_id > 0 => {
+                let exists = state
+                    .db
+                    .list_user_group_members(permission.subject_id)
+                    .await
+                    .map_err(|error| {
+                        log::error!("Failed to validate address book user group: {}", error);
+                        ApiError::internal()
+                    })?
+                    .is_some();
+                if !exists {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "User group not found",
+                    ));
+                }
+            }
+            _ => {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid address book permission subject",
+                ));
+            }
+        }
+    }
+    let updated = state
+        .db
+        .set_address_book_permissions(id, &request.permissions)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to update address book permissions: {}", error);
+            ApiError::internal()
+        })?;
+    if !updated {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Address book not found",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn require_address_book_access(
+    state: &ApiState,
+    headers: &HeaderMap,
+    book_id: i64,
+    required: &str,
+) -> Result<User, ApiError> {
+    let user = authenticated_user(state, headers).await?;
+    if user.is_admin {
+        return Ok(user);
+    }
+    let permission = state
+        .db
+        .address_book_permission(book_id, user.id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to authorize address book access: {}", error);
+            ApiError::internal()
+        })?;
+    let permission_level = permission
+        .as_deref()
+        .map(address_book_permission_level)
+        .unwrap_or(0);
+    if permission_level < address_book_permission_level(required) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Address book access denied",
+        ));
+    }
+    Ok(user)
+}
+
+fn address_book_permission_level(permission: &str) -> u8 {
+    match permission {
+        "read" => 1,
+        "write" => 2,
+        "manage" => 3,
+        _ => 0,
+    }
+}
+
+fn validate_address_book(name: &str, description: &str) -> Result<(), ApiError> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 100 || name.chars().any(char::is_control) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Address book name must be 1-100 bytes and contain no control characters",
+        ));
+    }
+    if description.len() > 300 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Address book description must be 300 bytes or fewer",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_address_book_entry(request: &AddressBookEntryRequest) -> Result<String, ApiError> {
+    let device_id = request.device_id.trim();
+    if device_id.is_empty() || device_id.len() > crate::peer::MAX_PEER_ID_LEN {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Address book device ID must be 1-100 bytes",
+        ));
+    }
+    if request.alias.len() > 100 || request.note.len() > 300 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Address book alias or note is too long",
+        ));
+    }
+    if request.tags.len() > 20
+        || request
+            .tags
+            .iter()
+            .any(|tag| tag.trim().is_empty() || tag.len() > 50)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Address book entries support up to 20 tags of 1-50 bytes",
+        ));
+    }
+    serde_json::to_string(
+        &request
+            .tags
+            .iter()
+            .map(|tag| tag.trim())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| {
+        log::error!("Failed to encode address book tags: {}", error);
+        ApiError::internal()
+    })
+}
+
+fn address_book_write_error(error: hbb_common::anyhow::Error) -> ApiError {
+    if let Some(sqlx::Error::Database(database_error)) = error.downcast_ref::<sqlx::Error>() {
+        if database_error.code().as_deref() == Some("2067")
+            || database_error.code().as_deref() == Some("1555")
+        {
+            return ApiError::new(
+                StatusCode::CONFLICT,
+                "Address book name or device ID already exists",
+            );
+        }
+    }
+    log::error!("Failed to save address book: {}", error);
     ApiError::internal()
 }
 
@@ -1252,6 +1744,32 @@ mod tests {
     }
 
     #[test]
+    fn validates_address_book_fields_and_permission_levels() {
+        assert!(validate_address_book("Shared", "Team devices").is_ok());
+        assert!(validate_address_book(" ", "").is_err());
+        assert!(validate_address_book("Bad\nName", "").is_err());
+        assert!(validate_address_book("Valid", &"x".repeat(301)).is_err());
+        assert_eq!(address_book_permission_level("read"), 1);
+        assert_eq!(address_book_permission_level("write"), 2);
+        assert_eq!(address_book_permission_level("manage"), 3);
+        assert_eq!(address_book_permission_level("unknown"), 0);
+        assert!(validate_address_book_entry(&AddressBookEntryRequest {
+            device_id: "device".to_owned(),
+            alias: String::new(),
+            note: String::new(),
+            tags: vec!["team".to_owned()],
+        })
+        .is_ok());
+        assert!(validate_address_book_entry(&AddressBookEntryRequest {
+            device_id: String::new(),
+            alias: String::new(),
+            note: String::new(),
+            tags: Vec::new(),
+        })
+        .is_err());
+    }
+
+    #[test]
     fn user_groups_are_admin_managed_and_account_scoped() {
         user_group_api_flow();
     }
@@ -1424,6 +1942,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let updated_groups = state.db.list_user_groups(100, 0).await.unwrap().0;
+        assert_eq!(updated_groups[0].name, "Research");
+        assert_eq!(updated_groups[0].description, "Updated");
         state.db.delete_user(alice_id).await.unwrap();
         assert_eq!(
             state.db.list_user_group_members(group_id).await.unwrap(),
@@ -1628,6 +2149,390 @@ mod tests {
         assert_eq!(
             state.db.list_device_group_peers(group_id).await.unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn address_books_enforce_acl_inheritance_and_write_access() {
+        address_book_api_flow();
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    async fn address_book_api_flow() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(file.path().to_str().unwrap()).await.unwrap();
+        db.create_user(
+            "admin",
+            "Admin",
+            "admin@example.com",
+            &hash("admin-test-password", DEFAULT_COST).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        let alice_id = db
+            .create_user(
+                "alice",
+                "Alice",
+                "alice@example.com",
+                &hash("alice-test-password", DEFAULT_COST).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+        db.create_user(
+            "bob",
+            "Bob",
+            "bob@example.com",
+            &hash("bob-test-password", DEFAULT_COST).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        let state = ApiState {
+            db: db.clone(),
+            jwt_secret: "address-book-test-secret".to_owned(),
+            peer_map: PeerMap::with_database(db),
+        };
+        let admin_headers = test_auth_headers(&state, "admin");
+        let alice_headers = test_auth_headers(&state, "alice");
+        let bob_headers = test_auth_headers(&state, "bob");
+        let (status, book) = create_address_book(
+            Extension(state.clone()),
+            admin_headers.clone(),
+            Json(AddressBookRequest {
+                name: "Shared".to_owned(),
+                description: "Team devices".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        let book_id = book["id"].as_i64().unwrap();
+        assert_eq!(
+            list_accessible_address_books(
+                Extension(state.clone()),
+                admin_headers.clone(),
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0["data"][0]["permission"],
+            "manage"
+        );
+        let group_id = state
+            .db
+            .create_user_group("Engineering", "Research team")
+            .await
+            .unwrap();
+        state
+            .db
+            .set_user_group_members(group_id, &[alice_id])
+            .await
+            .unwrap();
+        assert_eq!(
+            update_address_book_permissions(
+                Extension(state.clone()),
+                admin_headers.clone(),
+                Path(book_id),
+                Json(AddressBookPermissionsRequest {
+                    permissions: vec![AddressBookPermission {
+                        subject_type: "group".to_owned(),
+                        subject_id: group_id,
+                        access: "read".to_owned(),
+                    }],
+                }),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            list_accessible_address_books(
+                Extension(state.clone()),
+                alice_headers.clone(),
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0["data"][0]["permission"],
+            "read"
+        );
+        assert_eq!(
+            list_accessible_address_books(
+                Extension(state.clone()),
+                bob_headers.clone(),
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0["total"],
+            0
+        );
+        assert_eq!(
+            create_address_book_entry(
+                Extension(state.clone()),
+                alice_headers.clone(),
+                Path(book_id),
+                Json(AddressBookEntryRequest {
+                    device_id: "alice-device".to_owned(),
+                    alias: "Workstation".to_owned(),
+                    note: String::new(),
+                    tags: vec!["team".to_owned()],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            update_address_book_permissions(
+                Extension(state.clone()),
+                admin_headers.clone(),
+                Path(book_id),
+                Json(AddressBookPermissionsRequest {
+                    permissions: vec![AddressBookPermission {
+                        subject_type: "group".to_owned(),
+                        subject_id: group_id,
+                        access: "write".to_owned(),
+                    }],
+                }),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let (entry_status, entry) = create_address_book_entry(
+            Extension(state.clone()),
+            alice_headers.clone(),
+            Path(book_id),
+            Json(AddressBookEntryRequest {
+                device_id: "alice-device".to_owned(),
+                alias: "Workstation".to_owned(),
+                note: "Office".to_owned(),
+                tags: vec!["team".to_owned()],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(entry_status, StatusCode::CREATED);
+        assert_eq!(entry["tags"], json!(["team"]));
+        let entry_id = entry["id"].as_i64().unwrap();
+        assert_eq!(
+            update_address_book_entry(
+                Extension(state.clone()),
+                alice_headers.clone(),
+                Path((book_id, entry_id)),
+                Json(AddressBookEntryRequest {
+                    device_id: "alice-device".to_owned(),
+                    alias: "Office workstation".to_owned(),
+                    note: "Updated".to_owned(),
+                    tags: vec!["team".to_owned(), "office".to_owned()],
+                }),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            update_address_book_entry(
+                Extension(state.clone()),
+                bob_headers.clone(),
+                Path((book_id, entry_id)),
+                Json(AddressBookEntryRequest {
+                    device_id: "alice-device".to_owned(),
+                    alias: String::new(),
+                    note: String::new(),
+                    tags: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            create_address_book_entry(
+                Extension(state.clone()),
+                bob_headers.clone(),
+                Path(book_id),
+                Json(AddressBookEntryRequest {
+                    device_id: "bob-device".to_owned(),
+                    alias: String::new(),
+                    note: String::new(),
+                    tags: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            update_address_book_permissions(
+                Extension(state.clone()),
+                admin_headers.clone(),
+                Path(book_id),
+                Json(AddressBookPermissionsRequest {
+                    permissions: vec![AddressBookPermission {
+                        subject_type: "group".to_owned(),
+                        subject_id: group_id,
+                        access: "manage".to_owned(),
+                    }],
+                }),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            list_address_book_permissions(
+                Extension(state.clone()),
+                alice_headers.clone(),
+                Path(book_id),
+            )
+            .await
+            .unwrap()
+            .0["permissions"][0]["access"],
+            "manage"
+        );
+        assert_eq!(
+            update_address_book_permissions(
+                Extension(state.clone()),
+                alice_headers.clone(),
+                Path(book_id),
+                Json(AddressBookPermissionsRequest {
+                    permissions: vec![AddressBookPermission {
+                        subject_type: "user".to_owned(),
+                        subject_id: i64::MAX,
+                        access: "manage".to_owned(),
+                    }],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            list_accessible_address_book_entries(
+                Extension(state.clone()),
+                bob_headers.clone(),
+                Path(book_id),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        update_address_book_permissions(
+            Extension(state.clone()),
+            admin_headers.clone(),
+            Path(book_id),
+            Json(AddressBookPermissionsRequest {
+                permissions: vec![
+                    AddressBookPermission {
+                        subject_type: "group".to_owned(),
+                        subject_id: group_id,
+                        access: "manage".to_owned(),
+                    },
+                    AddressBookPermission {
+                        subject_type: "everyone".to_owned(),
+                        subject_id: 0,
+                        access: "read".to_owned(),
+                    },
+                ],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            list_accessible_address_books(
+                Extension(state.clone()),
+                alice_headers.clone(),
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0["data"][0]["permission"],
+            "manage"
+        );
+        assert_eq!(
+            list_accessible_address_books(
+                Extension(state.clone()),
+                bob_headers.clone(),
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0["data"][0]["permission"],
+            "read"
+        );
+        assert_eq!(
+            list_accessible_address_book_entries(
+                Extension(state.clone()),
+                bob_headers,
+                Path(book_id),
+            )
+            .await
+            .unwrap()
+            .0["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_accessible_address_book_entries(
+                Extension(state.clone()),
+                admin_headers,
+                Path(book_id),
+            )
+            .await
+            .unwrap()
+            .0["data"][0]["id"],
+            entry_id
+        );
+        assert_eq!(
+            delete_address_book_entry(
+                Extension(state.clone()),
+                alice_headers,
+                Path((book_id, entry_id)),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            state
+                .db
+                .list_address_book_entries(book_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            0
         );
     }
 
