@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use hbb_common::{log, ResultType};
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
+    sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, QueryBuilder,
+    Sqlite, SqliteConnection,
 };
 use std::{ops::DerefMut, str::FromStr};
 //use sqlx::postgres::PgPoolOptions;
@@ -132,6 +133,24 @@ pub struct ApiToken {
 pub struct ApiTokenAuth {
     pub owner_id: i64,
     pub scopes: String,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct DelegatedRole {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub permissions: String,
+    pub user_group_ids: String,
+    pub device_group_ids: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct DelegatedRoleAccess {
+    pub permissions: String,
+    pub user_group_ids: String,
+    pub device_group_ids: String,
 }
 
 impl Database {
@@ -276,7 +295,23 @@ impl Database {
                 revoked_at datetime
             );
             create index if not exists index_api_tokens_owner
-                on api_tokens (owner_id, created_at);",
+                on api_tokens (owner_id, created_at);
+            create table if not exists delegated_roles (
+                id integer primary key autoincrement,
+                name varchar(100) not null collate nocase unique,
+                description varchar(300) not null default '',
+                permissions text not null,
+                user_group_ids text not null,
+                device_group_ids text not null,
+                created_at datetime not null default(current_timestamp)
+            );
+            create table if not exists delegated_role_members (
+                role_id integer not null,
+                user_id integer not null,
+                primary key (role_id, user_id)
+            );
+            create index if not exists index_delegated_role_members_user
+                on delegated_role_members (user_id);",
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
@@ -505,6 +540,319 @@ impl Database {
         Ok((users, total))
     }
 
+    pub async fn list_users_in_groups(
+        &self,
+        group_ids: &[i64],
+        status: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<User>, i64)> {
+        if group_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let mut conn = self.pool.get().await?;
+        let group_placeholders = vec!["?"; group_ids.len()].join(", ");
+        let users_sql = format!(
+            "select id, name, display_name, email, avatar, note, password_hash, is_admin, status, created_at from users where (? is null or status = ?) and exists (select 1 from user_group_members gm where gm.user_id = users.id and gm.group_id in ({group_placeholders})) order by id limit ? offset ?"
+        );
+        let mut users_query = sqlx::query_as::<_, User>(&users_sql)
+            .bind(status)
+            .bind(status);
+        for group_id in group_ids {
+            users_query = users_query.bind(group_id);
+        }
+        let users = users_query
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(conn.deref_mut())
+            .await?;
+
+        let count_sql = format!(
+            "select count(*) from users where (? is null or status = ?) and exists (select 1 from user_group_members gm where gm.user_id = users.id and gm.group_id in ({group_placeholders}))"
+        );
+        let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql)
+            .bind(status)
+            .bind(status);
+        for group_id in group_ids {
+            count_query = count_query.bind(group_id);
+        }
+        let total = count_query.fetch_one(conn.deref_mut()).await?;
+        Ok((users, total))
+    }
+
+    pub async fn list_peers_in_groups(
+        &self,
+        group_ids: &[i64],
+        status: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<Peer>, i64)> {
+        if group_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let mut conn = self.pool.get().await?;
+        let group_placeholders = vec!["?"; group_ids.len()].join(", ");
+        let peers_sql = format!(
+            "select guid, id, uuid, pk, user, status, info, coalesce(note, '') as note from peer where (? is null or coalesce(status, 1) = ?) and exists (select 1 from device_group_peers gp where gp.peer_id = peer.id and gp.group_id in ({group_placeholders})) order by id limit ? offset ?"
+        );
+        let mut peers_query = sqlx::query_as::<_, Peer>(&peers_sql)
+            .bind(status)
+            .bind(status);
+        for group_id in group_ids {
+            peers_query = peers_query.bind(group_id);
+        }
+        let peers = peers_query
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(conn.deref_mut())
+            .await?;
+
+        let count_sql = format!(
+            "select count(*) from peer where (? is null or coalesce(status, 1) = ?) and exists (select 1 from device_group_peers gp where gp.peer_id = peer.id and gp.group_id in ({group_placeholders}))"
+        );
+        let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql)
+            .bind(status)
+            .bind(status);
+        for group_id in group_ids {
+            count_query = count_query.bind(group_id);
+        }
+        let total = count_query.fetch_one(conn.deref_mut()).await?;
+        Ok((peers, total))
+    }
+
+    pub async fn update_user_in_groups(
+        &self,
+        id: i64,
+        display_name: &str,
+        email: &str,
+        password_hash: Option<&str>,
+        group_ids: &[i64],
+    ) -> ResultType<bool> {
+        if group_ids.is_empty() {
+            return Ok(false);
+        }
+        let mut query = QueryBuilder::<Sqlite>::new("update users set display_name = ");
+        query
+            .push_bind(display_name)
+            .push(", email = ")
+            .push_bind(email)
+            .push(", password_hash = coalesce(")
+            .push_bind(password_hash)
+            .push(", password_hash) where id = ")
+            .push_bind(id)
+            .push(" and is_admin = 0 and status = 1 and exists (select 1 from user_group_members gm where gm.user_id = users.id and gm.group_id in (");
+        for (index, group_id) in group_ids.iter().enumerate() {
+            if index > 0 {
+                query.push(", ");
+            }
+            query.push_bind(group_id);
+        }
+        query.push("))");
+        let result = query
+            .build()
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn update_peer_note_in_groups(
+        &self,
+        id: &str,
+        note: &str,
+        expected_owner: Option<&str>,
+        group_ids: &[i64],
+    ) -> ResultType<bool> {
+        if group_ids.is_empty() {
+            return Ok(false);
+        }
+        let mut query = QueryBuilder::<Sqlite>::new("update peer set note = ");
+        let owner_bytes = expected_owner.map(str::as_bytes);
+        query
+            .push_bind(note)
+            .push(" where id = ")
+            .push_bind(id)
+            .push(" and (( ")
+            .push_bind(owner_bytes)
+            .push(" is null and user is null) or user = ")
+            .push_bind(owner_bytes)
+            .push(") and exists (select 1 from device_group_peers gp where gp.peer_id = peer.id and gp.group_id in (");
+        for (index, group_id) in group_ids.iter().enumerate() {
+            if index > 0 {
+                query.push(", ");
+            }
+            query.push_bind(group_id);
+        }
+        query.push("))");
+        let result = query
+            .build()
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delegated_role_group_ids_exist(
+        &self,
+        user_group_ids: &[i64],
+        device_group_ids: &[i64],
+    ) -> ResultType<bool> {
+        let user_count: i64 = sqlx::query_scalar(
+            "select count(*) from user_groups where id in (select value from json_each(?))",
+        )
+        .bind(serde_json::to_string(user_group_ids)?)
+        .fetch_one(self.pool.get().await?.deref_mut())
+        .await?;
+        let device_count: i64 = sqlx::query_scalar(
+            "select count(*) from device_groups where id in (select value from json_each(?))",
+        )
+        .bind(serde_json::to_string(device_group_ids)?)
+        .fetch_one(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(user_count == user_group_ids.len() as i64
+            && device_count == device_group_ids.len() as i64)
+    }
+
+    pub async fn delegated_role_member_ids_exist(&self, user_ids: &[i64]) -> ResultType<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "select count(*) from users where id in (select value from json_each(?))",
+        )
+        .bind(serde_json::to_string(user_ids)?)
+        .fetch_one(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(count == user_ids.len() as i64)
+    }
+
+    pub async fn list_delegated_roles(&self) -> ResultType<Vec<(DelegatedRole, Vec<i64>)>> {
+        let mut conn = self.pool.get().await?;
+        let roles = sqlx::query_as::<_, DelegatedRole>(
+            "select id, name, description, permissions, user_group_ids, device_group_ids, created_at from delegated_roles order by name collate nocase",
+        )
+        .fetch_all(conn.deref_mut())
+        .await?;
+        let mut result = Vec::with_capacity(roles.len());
+        for role in roles {
+            let members = sqlx::query_scalar(
+                "select user_id from delegated_role_members where role_id = ? order by user_id",
+            )
+            .bind(role.id)
+            .fetch_all(conn.deref_mut())
+            .await?;
+            result.push((role, members));
+        }
+        Ok(result)
+    }
+
+    pub async fn create_delegated_role(
+        &self,
+        name: &str,
+        description: &str,
+        permissions: &str,
+        user_group_ids: &str,
+        device_group_ids: &str,
+        user_ids: &[i64],
+    ) -> ResultType<i64> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let result = sqlx::query(
+            "insert into delegated_roles(name, description, permissions, user_group_ids, device_group_ids) values(?, ?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(description)
+        .bind(permissions)
+        .bind(user_group_ids)
+        .bind(device_group_ids)
+        .execute(&mut *tx)
+        .await?;
+        let id = result.last_insert_rowid();
+        for user_id in user_ids {
+            sqlx::query("insert into delegated_role_members(role_id, user_id) values(?, ?)")
+                .bind(id)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    pub async fn update_delegated_role(
+        &self,
+        id: i64,
+        name: &str,
+        description: &str,
+        permissions: &str,
+        user_group_ids: &str,
+        device_group_ids: &str,
+        user_ids: &[i64],
+    ) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let result = sqlx::query(
+            "update delegated_roles set name = ?, description = ?, permissions = ?, user_group_ids = ?, device_group_ids = ? where id = ?",
+        )
+        .bind(name)
+        .bind(description)
+        .bind(permissions)
+        .bind(user_group_ids)
+        .bind(device_group_ids)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("delete from delegated_role_members where role_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for user_id in user_ids {
+            sqlx::query("insert into delegated_role_members(role_id, user_id) values(?, ?)")
+                .bind(id)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn delete_delegated_role(&self, id: i64) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        sqlx::query("delete from delegated_role_members where role_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let result = sqlx::query("delete from delegated_roles where id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delegated_access_for_user(
+        &self,
+        user_id: i64,
+    ) -> ResultType<Vec<DelegatedRoleAccess>> {
+        Ok(sqlx::query_as::<_, DelegatedRoleAccess>(
+            "select r.permissions, r.user_group_ids, r.device_group_ids from delegated_roles r join delegated_role_members m on m.role_id = r.id where m.user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    pub async fn delegated_access_exists(&self, user_id: i64) -> ResultType<bool> {
+        let exists: i64 = sqlx::query_scalar(
+            "select exists(select 1 from delegated_role_members m join delegated_roles r on r.id = m.role_id where m.user_id = ?)",
+        )
+        .bind(user_id)
+        .fetch_one(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(exists != 0)
+    }
+
     pub async fn create_user(
         &self,
         name: &str,
@@ -587,6 +935,10 @@ impl Database {
             .execute(conn.deref_mut())
             .await?;
         sqlx::query("delete from user_group_members where user_id = ?")
+            .bind(id)
+            .execute(conn.deref_mut())
+            .await?;
+        sqlx::query("delete from delegated_role_members where user_id = ?")
             .bind(id)
             .execute(conn.deref_mut())
             .await?;

@@ -1,6 +1,6 @@
 use crate::{
     common::get_arg_opt,
-    database::{AddressBookPermission, Database, User},
+    database::{AddressBookPermission, Database, DelegatedRole, User},
     peer::PeerMap,
 };
 use axum::{
@@ -110,6 +110,20 @@ struct CreateApiTokenRequest {
 }
 
 #[derive(Deserialize)]
+struct DelegatedRoleRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    permissions: Vec<String>,
+    #[serde(default)]
+    user_group_ids: Vec<i64>,
+    #[serde(default)]
+    device_group_ids: Vec<i64>,
+    #[serde(default)]
+    user_ids: Vec<i64>,
+}
+
+#[derive(Deserialize)]
 struct CreateUser {
     name: String,
     email: String,
@@ -192,7 +206,7 @@ struct AddressBookPermissionsRequest {
     permissions: Vec<AddressBookPermission>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct UserPayload {
     id: i64,
     name: String,
@@ -201,6 +215,7 @@ struct UserPayload {
     avatar: String,
     note: String,
     is_admin: bool,
+    is_delegated_admin: bool,
     status: i64,
 }
 
@@ -214,6 +229,7 @@ impl From<User> for UserPayload {
             avatar: user.avatar,
             note: user.note,
             is_admin: user.is_admin,
+            is_delegated_admin: false,
             status: user.status,
         }
     }
@@ -301,6 +317,14 @@ pub(crate) async fn start(
         )
         .route("/api/admin/users", get(list_admin_users).post(create_user))
         .route("/api/admin/users/:id", put(update_user).delete(delete_user))
+        .route(
+            "/api/admin/delegated-roles",
+            get(list_admin_delegated_roles).post(create_admin_delegated_role),
+        )
+        .route(
+            "/api/admin/delegated-roles/:id",
+            put(update_admin_delegated_role).delete(delete_admin_delegated_role),
+        )
         .route("/api/admin/audit-logs", get(list_admin_audit_logs))
         .route(
             "/api/admin/api-tokens",
@@ -430,10 +454,19 @@ async fn login(
         log::error!("Failed to create API access token: {}", error);
         ApiError::internal()
     })?;
+    let mut user_payload = UserPayload::from(user);
+    user_payload.is_delegated_admin = state
+        .db
+        .delegated_access_exists(user_payload.id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to determine delegated role membership: {}", error);
+            ApiError::internal()
+        })?;
     Ok(Json(json!({
         "type": "access_token",
         "access_token": token,
-        "user": UserPayload::from(user),
+        "user": user_payload,
     })))
 }
 
@@ -446,7 +479,16 @@ async fn current_user(
     headers: HeaderMap,
 ) -> Result<Json<UserPayload>, ApiError> {
     let user = authenticated_user(&state, &headers).await?;
-    Ok(Json(user.into()))
+    let mut user_payload = UserPayload::from(user);
+    user_payload.is_delegated_admin = state
+        .db
+        .delegated_access_exists(user_payload.id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to determine delegated role membership: {}", error);
+            ApiError::internal()
+        })?;
+    Ok(Json(user_payload))
 }
 
 async fn logout(
@@ -477,8 +519,29 @@ async fn list_admin_users(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers, "users:read").await?;
-    users_response(&state.db, query, false, None).await
+    let access = require_resource_access(&state, &headers, "users:read").await?;
+    if access.user.is_admin {
+        return users_response(&state.db, query, false, None).await;
+    }
+    let current = query.current.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
+    let (users, total) = state
+        .db
+        .list_users_in_groups(
+            &access.user_group_ids,
+            query.status,
+            page_size,
+            current.saturating_sub(1).saturating_mul(page_size),
+        )
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list users in delegated groups: {}", error);
+            ApiError::internal()
+        })?;
+    Ok(Json(json!({
+        "total": total,
+        "data": users.into_iter().map(UserPayload::from).collect::<Vec<_>>(),
+    })))
 }
 
 async fn users_response(
@@ -528,6 +591,7 @@ async fn list_peers(
         &state.peer_map,
         query,
         (!user.is_admin).then_some(user.name),
+        None,
     )
     .await
 }
@@ -1705,8 +1769,9 @@ async fn list_admin_peers(
     headers: HeaderMap,
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers, "devices:read").await?;
-    peers_response(&state.db, &state.peer_map, query, None).await
+    let access = require_resource_access(&state, &headers, "devices:read").await?;
+    let group_ids = (!access.user.is_admin).then_some(access.device_group_ids.as_slice());
+    peers_response(&state.db, &state.peer_map, query, None, group_ids).await
 }
 
 async fn list_admin_audit_logs(
@@ -1784,6 +1849,288 @@ async fn list_admin_api_tokens(
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Json(json!({ "data": data })))
+}
+
+async fn list_admin_delegated_roles(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin_session(&state, &headers).await?;
+    let roles = state.db.list_delegated_roles().await.map_err(|error| {
+        log::error!("Failed to list delegated roles: {}", error);
+        ApiError::internal()
+    })?;
+    let data = roles
+        .into_iter()
+        .map(|(role, user_ids)| delegated_role_payload(role, user_ids))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(json!({ "data": data })))
+}
+
+async fn create_admin_delegated_role(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<DelegatedRoleRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let actor = require_admin_session(&state, &headers).await?;
+    let fields = validate_delegated_role_request(&state, &request).await?;
+    let id = state
+        .db
+        .create_delegated_role(
+            &fields.name,
+            &fields.description,
+            &fields.permissions,
+            &fields.user_group_ids,
+            &fields.device_group_ids,
+            &request.user_ids,
+        )
+        .await
+        .map_err(delegated_role_write_error)?;
+    record_admin_audit(
+        &state,
+        &actor,
+        "create",
+        "delegated_role",
+        &id.to_string(),
+        "Created delegated administrator role",
+    )
+    .await?;
+    let role = state
+        .db
+        .list_delegated_roles()
+        .await
+        .map_err(|_| ApiError::internal())?
+        .into_iter()
+        .find(|(role, _)| role.id == id)
+        .ok_or_else(ApiError::internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(delegated_role_payload(role.0, role.1)?),
+    ))
+}
+
+async fn update_admin_delegated_role(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(request): Json<DelegatedRoleRequest>,
+) -> Result<StatusCode, ApiError> {
+    let actor = require_admin_session(&state, &headers).await?;
+    let fields = validate_delegated_role_request(&state, &request).await?;
+    let updated = state
+        .db
+        .update_delegated_role(
+            id,
+            &fields.name,
+            &fields.description,
+            &fields.permissions,
+            &fields.user_group_ids,
+            &fields.device_group_ids,
+            &request.user_ids,
+        )
+        .await
+        .map_err(delegated_role_write_error)?;
+    if !updated {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Delegated role not found",
+        ));
+    }
+    record_admin_audit(
+        &state,
+        &actor,
+        "update",
+        "delegated_role",
+        &id.to_string(),
+        "Updated delegated administrator role",
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_admin_delegated_role(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let actor = require_admin_session(&state, &headers).await?;
+    if !state.db.delete_delegated_role(id).await.map_err(|error| {
+        log::error!("Failed to delete delegated role: {}", error);
+        ApiError::internal()
+    })? {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Delegated role not found",
+        ));
+    }
+    record_admin_audit(
+        &state,
+        &actor,
+        "delete",
+        "delegated_role",
+        &id.to_string(),
+        "Deleted delegated administrator role",
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+struct ValidatedDelegatedRole {
+    name: String,
+    description: String,
+    permissions: String,
+    user_group_ids: String,
+    device_group_ids: String,
+}
+
+async fn validate_delegated_role_request(
+    state: &ApiState,
+    request: &DelegatedRoleRequest,
+) -> Result<ValidatedDelegatedRole, ApiError> {
+    let name = request.name.trim();
+    if name.is_empty() || name.len() > 100 || name.chars().any(char::is_control) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Role name must be 1-100 bytes and contain no control characters",
+        ));
+    }
+    if request.description.len() > 300 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Role description must be 300 bytes or fewer",
+        ));
+    }
+    const ALLOWED: [&str; 4] = ["users:read", "users:write", "devices:read", "devices:write"];
+    let mut permissions = HashSet::with_capacity(request.permissions.len());
+    if request.permissions.is_empty()
+        || request.permissions.len() > ALLOWED.len()
+        || request.permissions.iter().any(|permission| {
+            !ALLOWED.contains(&permission.as_str()) || !permissions.insert(permission)
+        })
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Only unique user and device read/write permissions can be delegated",
+        ));
+    }
+    if request.user_group_ids.len() > 500
+        || request.device_group_ids.len() > 500
+        || request.user_ids.len() > 5000
+        || request
+            .user_group_ids
+            .iter()
+            .chain(request.device_group_ids.iter())
+            .any(|id| *id <= 0)
+        || request.user_ids.iter().any(|id| *id <= 0)
+        || has_duplicates(&request.user_group_ids)
+        || has_duplicates(&request.device_group_ids)
+        || has_duplicates(&request.user_ids)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid or duplicate role scope or member IDs",
+        ));
+    }
+    let has_user_permission = request
+        .permissions
+        .iter()
+        .any(|permission| permission.starts_with("users:"));
+    let has_device_permission = request
+        .permissions
+        .iter()
+        .any(|permission| permission.starts_with("devices:"));
+    if (has_user_permission && request.user_group_ids.is_empty())
+        || (!has_user_permission && !request.user_group_ids.is_empty())
+        || (has_device_permission && request.device_group_ids.is_empty())
+        || (!has_device_permission && !request.device_group_ids.is_empty())
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Each delegated resource permission requires matching explicit group scopes",
+        ));
+    }
+    if !state
+        .db
+        .delegated_role_group_ids_exist(&request.user_group_ids, &request.device_group_ids)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to validate delegated role group scopes: {}", error);
+            ApiError::internal()
+        })?
+        || !state
+            .db
+            .delegated_role_member_ids_exist(&request.user_ids)
+            .await
+            .map_err(|error| {
+                log::error!("Failed to validate delegated role members: {}", error);
+                ApiError::internal()
+            })?
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Role references a group or user that does not exist",
+        ));
+    }
+    Ok(ValidatedDelegatedRole {
+        name: name.to_owned(),
+        description: request.description.trim().to_owned(),
+        permissions: serde_json::to_string(&request.permissions)
+            .map_err(|_| ApiError::internal())?,
+        user_group_ids: serde_json::to_string(&request.user_group_ids)
+            .map_err(|_| ApiError::internal())?,
+        device_group_ids: serde_json::to_string(&request.device_group_ids)
+            .map_err(|_| ApiError::internal())?,
+    })
+}
+
+fn has_duplicates<T: Eq + std::hash::Hash>(values: &[T]) -> bool {
+    let mut unique = HashSet::with_capacity(values.len());
+    values.iter().any(|value| !unique.insert(value))
+}
+
+fn delegated_role_write_error(error: hbb_common::anyhow::Error) -> ApiError {
+    if let Some(sqlx::Error::Database(database_error)) = error.downcast_ref::<sqlx::Error>() {
+        if database_error.code().as_deref() == Some("2067")
+            || database_error.code().as_deref() == Some("1555")
+        {
+            return ApiError::new(StatusCode::CONFLICT, "Delegated role name already exists");
+        }
+    }
+    log::error!("Failed to save delegated role: {}", error);
+    ApiError::internal()
+}
+
+fn delegated_role_payload(role: DelegatedRole, user_ids: Vec<i64>) -> Result<Value, ApiError> {
+    let permissions = serde_json::from_str::<Vec<String>>(&role.permissions).map_err(|error| {
+        log::error!("Failed to decode delegated role permissions: {}", error);
+        ApiError::internal()
+    })?;
+    let user_group_ids =
+        serde_json::from_str::<Vec<i64>>(&role.user_group_ids).map_err(|error| {
+            log::error!(
+                "Failed to decode delegated role user group scopes: {}",
+                error
+            );
+            ApiError::internal()
+        })?;
+    let device_group_ids =
+        serde_json::from_str::<Vec<i64>>(&role.device_group_ids).map_err(|error| {
+            log::error!(
+                "Failed to decode delegated role device group scopes: {}",
+                error
+            );
+            ApiError::internal()
+        })?;
+    Ok(json!({
+        "id": role.id,
+        "name": role.name,
+        "description": role.description,
+        "permissions": permissions,
+        "user_group_ids": user_group_ids,
+        "device_group_ids": device_group_ids,
+        "user_ids": user_ids,
+        "created_at": role.created_at,
+    }))
 }
 
 async fn create_admin_api_token(
@@ -1927,7 +2274,8 @@ async fn update_peer(
     Path(id): Path<String>,
     Json(request): Json<UpdatePeer>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_admin(&state, &headers, "devices:write").await?;
+    let access = require_resource_access(&state, &headers, "devices:write").await?;
+    let actor = access.user;
     if id.trim().is_empty() || id.len() > crate::peer::MAX_PEER_ID_LEN {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Invalid device ID"));
     }
@@ -1936,6 +2284,35 @@ async fn update_peer(
             StatusCode::BAD_REQUEST,
             "Device note must be 300 bytes or fewer",
         ));
+    }
+    if !actor.is_admin {
+        let expected_owner = request.user.trim();
+        let updated = state
+            .db
+            .update_peer_note_in_groups(
+                &id,
+                request.note.trim(),
+                (!expected_owner.is_empty()).then_some(expected_owner),
+                &access.device_group_ids,
+            )
+            .await
+            .map_err(|error| {
+                log::error!("Failed to update delegated device note: {}", error);
+                ApiError::internal()
+            })?;
+        if !updated {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "Device not found"));
+        }
+        record_admin_audit(
+            &state,
+            &actor,
+            "update",
+            "device",
+            &id,
+            "Updated device note",
+        )
+        .await?;
+        return Ok(StatusCode::NO_CONTENT);
     }
     let owner = request.user.trim();
     let owner = if owner.is_empty() {
@@ -1981,21 +2358,31 @@ async fn peers_response(
     peer_map: &PeerMap,
     query: Pagination,
     owner: Option<String>,
+    group_ids: Option<&[i64]>,
 ) -> Result<Json<Value>, ApiError> {
     let current = query.current.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
-    let (peers, total) = db
-        .list_peers(
+    let (peers, total) = if let Some(group_ids) = group_ids {
+        db.list_peers_in_groups(
+            group_ids,
+            query.status,
+            page_size,
+            current.saturating_sub(1).saturating_mul(page_size),
+        )
+        .await
+    } else {
+        db.list_peers(
             owner.as_deref(),
             query.status,
             page_size,
-            (current - 1) * page_size,
+            current.saturating_sub(1).saturating_mul(page_size),
         )
         .await
-        .map_err(|error| {
-            log::error!("Failed to list devices: {}", error);
-            ApiError::internal()
-        })?;
+    }
+    .map_err(|error| {
+        log::error!("Failed to list devices: {}", error);
+        ApiError::internal()
+    })?;
     let mut data = Vec::with_capacity(peers.len());
     for peer in peers {
         let user = peer
@@ -2071,7 +2458,8 @@ async fn update_user(
     Path(id): Path<i64>,
     Json(request): Json<UpdateUser>,
 ) -> Result<Json<UserPayload>, ApiError> {
-    let actor = require_admin(&state, &headers, "users:write").await?;
+    let access = require_resource_access(&state, &headers, "users:write").await?;
+    let actor = access.user;
     if request.status != 0 && request.status != 1 {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -2081,6 +2469,52 @@ async fn update_user(
     validate_email(&request.email)?;
     if let Some(password) = &request.password {
         validate_password(password)?;
+    }
+    if !actor.is_admin {
+        if request.is_admin || request.status != 1 {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "Delegated administrators cannot change account status or administrator privileges",
+            ));
+        }
+        let password_hash = request
+            .password
+            .map(|password| hash(password, DEFAULT_COST))
+            .transpose()
+            .map_err(|error| {
+                log::error!("Failed to hash delegated account password: {}", error);
+                ApiError::internal()
+            })?;
+        let updated = state
+            .db
+            .update_user_in_groups(
+                id,
+                request.display_name.trim(),
+                request.email.trim(),
+                password_hash.as_deref(),
+                &access.user_group_ids,
+            )
+            .await
+            .map_err(database_write_error)?;
+        if !updated {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "User not found"));
+        }
+        record_admin_audit(
+            &state,
+            &actor,
+            "update",
+            "user",
+            &id.to_string(),
+            "Updated user profile",
+        )
+        .await?;
+        let user = state
+            .db
+            .get_user_by_id(id)
+            .await
+            .map_err(|_| ApiError::internal())?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "User not found"))?;
+        return Ok(Json(user.into()));
     }
     let target = state
         .db
@@ -2207,6 +2641,103 @@ async fn require_admin(
     Ok(user)
 }
 
+struct ResourceAccess {
+    user: User,
+    user_group_ids: Vec<i64>,
+    device_group_ids: Vec<i64>,
+}
+
+async fn require_resource_access(
+    state: &ApiState,
+    headers: &HeaderMap,
+    required_scope: &str,
+) -> Result<ResourceAccess, ApiError> {
+    let user = authenticated_scoped_user(state, headers, required_scope).await?;
+    if user.is_admin {
+        return Ok(ResourceAccess {
+            user,
+            user_group_ids: Vec::new(),
+            device_group_ids: Vec::new(),
+        });
+    }
+    let roles = state
+        .db
+        .delegated_access_for_user(user.id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to load delegated access roles: {}", error);
+            ApiError::internal()
+        })?;
+    let mut user_group_ids = HashSet::new();
+    let mut device_group_ids = HashSet::new();
+    let mut scope_allowed = false;
+    for role in roles {
+        let permissions =
+            serde_json::from_str::<Vec<String>>(&role.permissions).map_err(|error| {
+                log::error!("Invalid persisted delegated role permissions: {}", error);
+                ApiError::internal()
+            })?;
+        let user_scopes =
+            serde_json::from_str::<Vec<i64>>(&role.user_group_ids).map_err(|error| {
+                log::error!("Invalid persisted delegated user group scope: {}", error);
+                ApiError::internal()
+            })?;
+        let device_scopes =
+            serde_json::from_str::<Vec<i64>>(&role.device_group_ids).map_err(|error| {
+                log::error!("Invalid persisted delegated device group scope: {}", error);
+                ApiError::internal()
+            })?;
+        if permissions.iter().any(|permission| {
+            !matches!(
+                permission.as_str(),
+                "users:read" | "users:write" | "devices:read" | "devices:write"
+            )
+        }) {
+            log::error!("Persisted delegated role contains an unsupported permission");
+            return Err(ApiError::internal());
+        }
+        let role_allows_scope = permissions.iter().any(|permission| {
+            permission == required_scope
+                || (required_scope.ends_with(":read")
+                    && permission.strip_suffix(":write") == required_scope.strip_suffix(":read"))
+        });
+        if role_allows_scope {
+            scope_allowed = true;
+            if required_scope.starts_with("users:") {
+                user_group_ids.extend(user_scopes);
+            } else {
+                device_group_ids.extend(device_scopes);
+            }
+        }
+    }
+    if !scope_allowed {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Delegated role permission is insufficient",
+        ));
+    }
+    let groups = if required_scope.starts_with("users:") {
+        &user_group_ids
+    } else {
+        &device_group_ids
+    };
+    if groups.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Delegated role has no resource group scope",
+        ));
+    }
+    let mut user_group_ids = user_group_ids.into_iter().collect::<Vec<_>>();
+    let mut device_group_ids = device_group_ids.into_iter().collect::<Vec<_>>();
+    user_group_ids.sort_unstable();
+    device_group_ids.sort_unstable();
+    Ok(ResourceAccess {
+        user,
+        user_group_ids,
+        device_group_ids,
+    })
+}
+
 async fn require_admin_session(state: &ApiState, headers: &HeaderMap) -> Result<User, ApiError> {
     let user = authenticated_user(state, headers).await?;
     if !user.is_admin {
@@ -2316,6 +2847,7 @@ fn valid_audit_resource_type(resource_type: &str) -> bool {
             | "user_group"
             | "address_book"
             | "address_book_entry"
+            | "delegated_role"
             | "api_token"
     )
 }
@@ -2450,6 +2982,427 @@ mod tests {
         assert!(validate_user_group(" ", "").is_err());
         assert!(validate_user_group("Control\nGroup", "").is_err());
         assert!(validate_user_group("Valid", &"x".repeat(301)).is_err());
+    }
+
+    #[test]
+    fn delegated_roles_persist_and_enforce_group_scoped_access() {
+        delegated_role_api_flow();
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    async fn delegated_role_api_flow() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(file.path().to_str().unwrap()).await.unwrap();
+        db.create_user(
+            "admin",
+            "Admin",
+            "admin@example.com",
+            &hash("admin-test-password", DEFAULT_COST).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        let delegated_id = db
+            .create_user(
+                "delegate",
+                "Delegate",
+                "delegate@example.com",
+                &hash("delegate-test-password", DEFAULT_COST).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+        let scoped_user_id = db
+            .create_user(
+                "scoped",
+                "Scoped",
+                "scoped@example.com",
+                &hash("scoped-test-password", DEFAULT_COST).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+        let outside_user_id = db
+            .create_user(
+                "outside",
+                "Outside",
+                "outside@example.com",
+                &hash("outside-test-password", DEFAULT_COST).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+        let user_group_id = db.create_user_group("Scoped users", "").await.unwrap();
+        db.set_user_group_members(user_group_id, &[scoped_user_id])
+            .await
+            .unwrap();
+        let readonly_group_id = db.create_user_group("Read-only users", "").await.unwrap();
+        db.set_user_group_members(readonly_group_id, &[outside_user_id])
+            .await
+            .unwrap();
+        let device_group_id = db.create_device_group("Scoped devices", "").await.unwrap();
+        let outside_device_group_id = db.create_device_group("Other devices", "").await.unwrap();
+        for (id, byte) in [("scoped-device", 1_u8), ("outside-device", 2_u8)] {
+            db.insert_peer(id, &[byte; 16], &[byte; 32], "{}")
+                .await
+                .unwrap();
+        }
+        db.set_device_group_peers(device_group_id, &["scoped-device".to_owned()])
+            .await
+            .unwrap();
+        db.set_device_group_peers(outside_device_group_id, &["outside-device".to_owned()])
+            .await
+            .unwrap();
+        let state = ApiState {
+            db: db.clone(),
+            jwt_secret: "delegated-role-test-secret".to_owned(),
+            peer_map: PeerMap::with_database(db.clone()),
+        };
+        let admin_headers = signed_test_headers(&state, "admin");
+        let delegated_headers = signed_test_headers(&state, "delegate");
+        let ordinary_headers = signed_test_headers(&state, "scoped");
+        let role_request = DelegatedRoleRequest {
+            name: "Scoped operators".to_owned(),
+            description: "Only selected groups".to_owned(),
+            permissions: vec![
+                "users:read".to_owned(),
+                "users:write".to_owned(),
+                "devices:read".to_owned(),
+                "devices:write".to_owned(),
+            ],
+            user_group_ids: vec![user_group_id],
+            device_group_ids: vec![device_group_id],
+            user_ids: vec![delegated_id],
+        };
+        let (status, created) = create_admin_delegated_role(
+            Extension(state.clone()),
+            admin_headers.clone(),
+            Json(role_request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["user_ids"], json!([delegated_id]));
+        let role_id = created["id"].as_i64().unwrap();
+        let login_response = login(
+            Extension(state.clone()),
+            Json(LoginRequest {
+                username: "delegate".to_owned(),
+                password: "delegate-test-password".to_owned(),
+                id: String::new(),
+                uuid: String::new(),
+                device_info: json!({}),
+                auto_login: false,
+                r#type: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(login_response["user"]["is_delegated_admin"], true);
+        assert!(
+            current_user(Extension(state.clone()), delegated_headers.clone())
+                .await
+                .unwrap()
+                .0
+                .is_delegated_admin
+        );
+        assert_eq!(
+            create_admin_delegated_role(
+                Extension(state.clone()),
+                delegated_headers.clone(),
+                Json(DelegatedRoleRequest {
+                    name: "forbidden".to_owned(),
+                    description: String::new(),
+                    permissions: Vec::new(),
+                    user_group_ids: Vec::new(),
+                    device_group_ids: Vec::new(),
+                    user_ids: vec![delegated_id],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            update_admin_delegated_role(
+                Extension(state.clone()),
+                delegated_headers.clone(),
+                Path(role_id),
+                Json(DelegatedRoleRequest {
+                    name: "attempted member escalation".to_owned(),
+                    description: String::new(),
+                    permissions: vec!["users:read".to_owned()],
+                    user_group_ids: vec![readonly_group_id],
+                    device_group_ids: Vec::new(),
+                    user_ids: vec![outside_user_id],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        db.create_delegated_role(
+            "Read-only role",
+            "",
+            r#"["users:read"]"#,
+            &serde_json::to_string(&vec![readonly_group_id]).unwrap(),
+            "[]",
+            &[delegated_id],
+        )
+        .await
+        .unwrap();
+        db.create_delegated_role(
+            "Read-only device role",
+            "",
+            r#"["devices:read"]"#,
+            "[]",
+            &serde_json::to_string(&vec![outside_device_group_id]).unwrap(),
+            &[delegated_id],
+        )
+        .await
+        .unwrap();
+        let persisted = list_admin_delegated_roles(Extension(state.clone()), admin_headers.clone())
+            .await
+            .unwrap()
+            .0;
+        let persisted_role = persisted["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|role| role["name"] == "Scoped operators")
+            .unwrap();
+        assert_eq!(persisted_role["user_group_ids"], json!([user_group_id]));
+        assert_eq!(persisted_role["device_group_ids"], json!([device_group_id]));
+
+        assert_eq!(
+            list_admin_delegated_roles(Extension(state.clone()), delegated_headers.clone(),)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            create_admin_delegated_role(
+                Extension(state.clone()),
+                admin_headers.clone(),
+                Json(DelegatedRoleRequest {
+                    name: "forbidden permission".to_owned(),
+                    description: String::new(),
+                    permissions: vec!["audit:read".to_owned()],
+                    user_group_ids: Vec::new(),
+                    device_group_ids: Vec::new(),
+                    user_ids: vec![delegated_id],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            list_admin_api_tokens(Extension(state.clone()), delegated_headers.clone())
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            list_admin_audit_logs(
+                Extension(state.clone()),
+                delegated_headers.clone(),
+                Query(AuditLogQuery {
+                    current: None,
+                    page_size: None,
+                    actor: None,
+                    action: None,
+                    resource_type: None,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            list_admin_users(
+                Extension(state.clone()),
+                ordinary_headers,
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let users = list_admin_users(
+            Extension(state.clone()),
+            delegated_headers.clone(),
+            Query(Pagination {
+                current: Some(1),
+                page_size: Some(100),
+                status: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(users["total"], 2);
+        let visible_user_ids = users["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|user| user["id"].as_i64().unwrap())
+            .collect::<HashSet<_>>();
+        assert!(visible_user_ids.contains(&scoped_user_id));
+        assert!(visible_user_ids.contains(&outside_user_id));
+        assert_eq!(
+            list_admin_device_groups(
+                Extension(state.clone()),
+                delegated_headers.clone(),
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let devices = list_admin_peers(
+            Extension(state.clone()),
+            delegated_headers.clone(),
+            Query(Pagination {
+                current: Some(1),
+                page_size: Some(100),
+                status: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(devices["total"], 2);
+        let visible_device_ids = devices["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|device| device["id"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+        assert!(visible_device_ids.contains("scoped-device"));
+        assert!(visible_device_ids.contains("outside-device"));
+
+        update_user(
+            Extension(state.clone()),
+            delegated_headers.clone(),
+            Path(scoped_user_id),
+            Json(UpdateUser {
+                email: "updated@example.com".to_owned(),
+                display_name: "Updated".to_owned(),
+                is_admin: false,
+                status: 1,
+                password: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            update_user(
+                Extension(state.clone()),
+                delegated_headers.clone(),
+                Path(outside_user_id),
+                Json(UpdateUser {
+                    email: "outside-updated@example.com".to_owned(),
+                    display_name: "Outside".to_owned(),
+                    is_admin: false,
+                    status: 1,
+                    password: None,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            update_user(
+                Extension(state.clone()),
+                delegated_headers.clone(),
+                Path(scoped_user_id),
+                Json(UpdateUser {
+                    email: "promote@example.com".to_owned(),
+                    display_name: "Promote".to_owned(),
+                    is_admin: true,
+                    status: 1,
+                    password: None,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+
+        update_peer(
+            Extension(state.clone()),
+            delegated_headers.clone(),
+            Path("scoped-device".to_owned()),
+            Json(UpdatePeer {
+                user: String::new(),
+                note: "within scope".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            update_peer(
+                Extension(state.clone()),
+                delegated_headers.clone(),
+                Path("outside-device".to_owned()),
+                Json(UpdatePeer {
+                    user: String::new(),
+                    note: "outside scope".to_owned(),
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            update_peer(
+                Extension(state.clone()),
+                delegated_headers.clone(),
+                Path("scoped-device".to_owned()),
+                Json(UpdatePeer {
+                    user: "scoped".to_owned(),
+                    note: "transfer attempt".to_owned(),
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            state
+                .db
+                .get_peer("outside-device")
+                .await
+                .unwrap()
+                .unwrap()
+                .note,
+            ""
+        );
     }
 
     #[test]
@@ -3723,6 +4676,28 @@ mod tests {
     }
 
     fn test_auth_headers(state: &ApiState, username: &str) -> HeaderMap {
+        let token = encode(
+            &Header::default(),
+            &Claims {
+                sub: username.to_owned(),
+                exp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as usize
+                    + 3600,
+            },
+            &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    fn signed_test_headers(state: &ApiState, username: &str) -> HeaderMap {
         let token = encode(
             &Header::default(),
             &Claims {

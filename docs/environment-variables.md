@@ -118,6 +118,18 @@ creation, listing, and revocation require an administrator login session and
 cannot be performed with an API token. Deleting an administrator also deletes
 their tokens.
 
+Administrators can also create directly assigned delegated administrator roles.
+Roles may grant only `users:read/write` and `devices:read/write`, with every
+resource permission requiring explicit user-group or device-group IDs. A write
+grant includes read access only for that same resource. Delegated user access
+filters list results by current user-group membership; delegated device access
+filters by current device-group membership. Scoped writes are limited to
+editing an active non-administrator user's profile/password or a device note.
+Delegated users cannot create/delete users, change account status or admin
+privileges, reassign devices, manage groups, roles, API tokens, address books,
+or audit logs. Role CRUD and membership assignment require an actual
+administrator login session.
+
 Relevant endpoints:
 
 | Endpoint | Access | Purpose |
@@ -142,6 +154,12 @@ Relevant endpoints:
 | `/api/admin/address-books` | Administrator | Create, list, update, and delete shared address books. |
 | `/api/admin/address-books/:id` | Administrator | Update or delete a shared address book. |
 | `/api/admin/users` | Administrator | Create, update, list, and delete accounts. |
+| `/api/admin/delegated-roles` | Administrator session | List or create roles; role data includes permissions, explicit group scopes, and directly assigned `user_ids`. |
+| `/api/admin/delegated-roles/:id` | Administrator session | Replace a role's permissions/scopes/members or delete it. |
+| `GET /api/admin/users` | Administrator or scoped delegated role | Delegated results include only users in the role's user groups. |
+| `GET /api/admin/peers` | Administrator or scoped delegated role | Delegated results include only devices in the role's device groups. |
+| `PUT /api/admin/users/:id` | Administrator or scoped `users:write` role | Delegated writes may update an active non-admin user's profile/password only, and only while the user remains in scope. |
+| `PUT /api/admin/peers/:id` | Administrator or scoped `devices:write` role | Delegated writes may change notes only, and only while the device remains in scope; ownership cannot be changed. |
 | `GET /api/admin/audit-logs` | Administrator | List successful management mutations; supports `current`, `pageSize`, `actor`, `action`, and `resourceType` filters. |
 | `GET /api/admin/api-tokens` | Administrator session | List the current administrator's token metadata; secret values are never returned. |
 | `POST /api/admin/api-tokens` | Administrator session | Create a scoped token; body: `{"name":"automation","scopes":["users:read"],"expiresInDays":90}`. The response contains the secret once. |
