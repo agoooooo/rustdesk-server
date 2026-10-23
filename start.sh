@@ -77,7 +77,9 @@ process_matches() {
     local actual_exe command_name
     [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]] || return 1
     IFS= read -r -d '' command_name < "/proc/$pid/cmdline" || return 1
-    [[ "$command_name" == "$binary" || "$command_name" == "$expected_exe" ]] || return 1
+    [[ "$command_name" == "$binary" ||
+        "$command_name" == "$expected_exe" ||
+        "${command_name##*/}" == "${binary##*/}" ]] || return 1
     actual_exe="$(readlink "/proc/$pid/exe")" || return 1
     [[ "$actual_exe" == "$expected_exe" || "$actual_exe" == "$expected_exe (deleted)" ]] || return 1
 }

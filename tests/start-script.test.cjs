@@ -45,11 +45,25 @@ test("server script recovers missing PID files and stops daemons with deleted bi
   t.after(cleanUp);
 
   await new Promise((resolve) => setTimeout(resolve, 100));
-  for (const name of ["hbbs", "hbbr"]) {
-    fs.unlinkSync(path.join(target, name));
+  const env = { ...process.env, DATA_DIR: data };
+  const started = spawnSync("bash", [script, "start"], {
+    encoding: "utf8",
+    env,
+  });
+  assert.equal(started.status, 0, started.stderr);
+  assert.match(started.stdout, new RegExp(`hbbs 已在运行 \\(PID ${daemons[0].pid}\\)`));
+  for (const [index, name] of ["hbbs", "hbbr"].entries()) {
+    assert.equal(
+      fs.readFileSync(path.join(run, `${name}.pid`), "utf8").trim(),
+      String(daemons[index].pid),
+    );
   }
 
-  const env = { ...process.env, DATA_DIR: data };
+  for (const name of ["hbbs", "hbbr"]) {
+    fs.unlinkSync(path.join(target, name));
+    fs.unlinkSync(path.join(run, `${name}.pid`));
+  }
+
   const status = spawnSync("bash", [script, "status"], {
     encoding: "utf8",
     env,
