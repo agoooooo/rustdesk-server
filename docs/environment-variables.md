@@ -70,6 +70,9 @@ management under `/api/admin`. A client login binds its registered device to
 the account only when the supplied device ID and base64 UUID match the existing
 server registration; an already-owned device cannot be claimed by another
 account. Administrators can assign, unassign, and annotate registered devices.
+Device list responses include an `online` boolean derived from hbbs's in-memory
+registration timestamp; a device is online while its last registration is
+within 30 seconds. This is live presence, not an active remote-control session.
 The first administrator is bootstrapped from `ADMIN_USER` /
 `ADMIN_PASSWORD`; there is no public registration endpoint. User accounts are
 stored in the existing SQLite database with bcrypt password hashes. Access
@@ -85,9 +88,9 @@ Relevant endpoints:
 | Endpoint | Access | Purpose |
 |---|---|---|
 | `POST /api/login` | Public | Authenticate; client requests may include the device `id` and base64 `uuid` to claim that registered device. |
-| `GET /api/peers` | Authenticated | List devices owned by the account; administrators can see all registered devices. |
+| `GET /api/peers` | Authenticated | List devices owned by the account; administrators can see all registered devices. Each item includes `online`, based on hbbs registration within the last 30 seconds. |
 | `GET /api/device-group/accessible` | Authenticated | Returns an empty list until device groups are implemented. |
-| `GET /api/admin/peers` | Administrator | List all registered devices. |
+| `GET /api/admin/peers` | Administrator | List all registered devices, including their recent online status. |
 | `PUT /api/admin/peers/:id` | Administrator | Assign/unassign a device and edit its note; JSON body: `{"user":"alice","note":"..."}`. Use an empty `user` to unassign. |
 | `/api/admin/users` | Administrator | Create, update, list, and delete accounts. |
 

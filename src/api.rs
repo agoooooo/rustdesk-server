@@ -1,6 +1,7 @@
 use crate::{
     common::get_arg_opt,
     database::{Database, User},
+    peer::PeerMap,
 };
 use axum::{
     extract::{Extension, Path, Query},
@@ -24,6 +25,7 @@ use tower_http::cors::CorsLayer;
 struct ApiState {
     db: Database,
     jwt_secret: String,
+    peer_map: PeerMap,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -136,14 +138,19 @@ impl From<User> for UserPayload {
     }
 }
 
-pub async fn start(
-    db: Database,
+pub(crate) async fn start(
+    peer_map: PeerMap,
     bind_addr: Option<IpAddr>,
     port: u16,
 ) -> hbb_common::ResultType<tokio::task::JoinHandle<hbb_common::ResultType<()>>> {
+    let db = peer_map.db.clone();
     let jwt_secret = db.get_or_create_api_secret().await?;
     bootstrap_admin(&db).await?;
-    let state = ApiState { db, jwt_secret };
+    let state = ApiState {
+        db,
+        jwt_secret,
+        peer_map,
+    };
     let app = Router::new()
         .route("/api/login", post(login))
         .route("/api/login-options", get(login_options))
@@ -369,7 +376,13 @@ async fn list_peers(
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
     let user = authenticated_user(&state, &headers).await?;
-    peers_response(&state.db, query, (!user.is_admin).then_some(user.name)).await
+    peers_response(
+        &state.db,
+        &state.peer_map,
+        query,
+        (!user.is_admin).then_some(user.name),
+    )
+    .await
 }
 
 async fn list_groups(
@@ -388,7 +401,7 @@ async fn list_admin_peers(
     Query(query): Query<Pagination>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    peers_response(&state.db, query, None).await
+    peers_response(&state.db, &state.peer_map, query, None).await
 }
 
 #[derive(Deserialize)]
@@ -448,6 +461,7 @@ async fn update_peer(
 
 async fn peers_response(
     db: &Database,
+    peer_map: &PeerMap,
     query: Pagination,
     owner: Option<String>,
 ) -> Result<Json<Value>, ApiError> {
@@ -465,27 +479,27 @@ async fn peers_response(
             log::error!("Failed to list devices: {}", error);
             ApiError::internal()
         })?;
-    let data = peers
-        .into_iter()
-        .map(|peer| {
-            let user = peer
-                .user
-                .as_deref()
-                .map(String::from_utf8_lossy)
-                .unwrap_or_default()
-                .into_owned();
-            let info = serde_json::from_str::<Value>(&peer.info).unwrap_or_else(|_| json!({}));
-            json!({
-                "id": peer.id,
-                "info": info,
-                "status": peer.status.unwrap_or(1),
-                "user": user,
-                "user_name": user,
-                "device_group_name": "",
-                "note": peer.note,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut data = Vec::with_capacity(peers.len());
+    for peer in peers {
+        let user = peer
+            .user
+            .as_deref()
+            .map(String::from_utf8_lossy)
+            .unwrap_or_default()
+            .into_owned();
+        let info = serde_json::from_str::<Value>(&peer.info).unwrap_or_else(|_| json!({}));
+        let online = peer_map.is_online(&peer.id).await;
+        data.push(json!({
+            "id": peer.id,
+            "info": info,
+            "status": peer.status.unwrap_or(1),
+            "online": online,
+            "user": user,
+            "user_name": user,
+            "device_group_name": "",
+            "note": peer.note,
+        }));
+    }
     Ok(Json(json!({ "total": total, "data": data })))
 }
 
@@ -788,9 +802,17 @@ mod tests {
         db.create_user("alice", "Alice", "alice@example.com", &password_hash, false)
             .await
             .unwrap();
+        let peer_map = PeerMap::with_database(db.clone());
+        peer_map
+            .get_or("test-device")
+            .await
+            .write()
+            .await
+            .last_reg_time = std::time::Instant::now();
         let state = ApiState {
             db: db.clone(),
             jwt_secret: "test-secret".to_owned(),
+            peer_map,
         };
         let response = login(
             Extension(state.clone()),
@@ -842,6 +864,7 @@ mod tests {
         assert_eq!(peers["total"], 1);
         assert_eq!(peers["data"][0]["id"], "test-device");
         assert_eq!(peers["data"][0]["user"], "alice");
+        assert_eq!(peers["data"][0]["online"], true);
         assert_eq!(
             list_groups(
                 Extension(state.clone()),
@@ -925,6 +948,34 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(bob_peers["total"], 0);
+        let admin_device = state.peer_map.get_or("stale-device").await;
+        admin_device.write().await.last_reg_time =
+            std::time::Instant::now() - std::time::Duration::from_secs(31);
+        state
+            .db
+            .insert_peer("stale-device", b"stale-uuid", b"stale-key", "{}")
+            .await
+            .unwrap();
+        state
+            .db
+            .update_peer_owner("stale-device", Some("alice"), "")
+            .await
+            .unwrap();
+        let alice_peers = list_peers(
+            Extension(state.clone()),
+            headers.clone(),
+            Query(Pagination {
+                current: Some(1),
+                page_size: Some(100),
+                status: Some(1),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(alice_peers["total"], 2);
+        assert_eq!(alice_peers["data"][0]["id"], "stale-device");
+        assert_eq!(alice_peers["data"][0]["online"], false);
 
         let denied = login(
             Extension(state.clone()),
@@ -972,6 +1023,7 @@ mod tests {
         let state = ApiState {
             db: db.clone(),
             jwt_secret: "test-secret".to_owned(),
+            peer_map: PeerMap::with_database(db.clone()),
         };
         db.insert_peer("admin-device", b"device-uuid", b"device-key", "{}")
             .await
@@ -1067,11 +1119,7 @@ mod tests {
         );
         assert!(db.get_user_by_id(created.id).await.unwrap().is_none());
         assert_eq!(
-            db.get_peer("admin-device")
-                .await
-                .unwrap()
-                .unwrap()
-                .user,
+            db.get_peer("admin-device").await.unwrap().unwrap().user,
             None
         );
     }

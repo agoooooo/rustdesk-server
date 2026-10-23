@@ -176,8 +176,25 @@ impl PeerMap {
         self.map.read().await.get(id).cloned()
     }
 
+    pub(crate) async fn is_online(&self, id: &str) -> bool {
+        let Some(peer) = self.get_in_memory(id).await else {
+            return false;
+        };
+        let online = peer.read().await.last_reg_time.elapsed().as_millis()
+            < crate::rendezvous_server::REG_TIMEOUT as u128;
+        online
+    }
+
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_database(db: database::Database) -> Self {
+        Self {
+            map: Default::default(),
+            db,
+        }
     }
 }

@@ -47,7 +47,7 @@ enum Data {
     RelayServers(RelayServers),
 }
 
-const REG_TIMEOUT: i64 = 30_000;
+pub(crate) const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
@@ -137,7 +137,7 @@ impl RendezvousServer {
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
         let mut socket = create_udp_listener(bind_addr, port, rmem).await?;
-        let api_db = pm.db.clone();
+        let api_peer_map = pm.clone();
         let (tx, mut rx) = mpsc::unbounded_channel::<Data>();
         let software_url = get_arg("software-url");
         let version = hbb_common::get_version_from_url(&software_url);
@@ -182,7 +182,7 @@ impl RendezvousServer {
                 .map(|value| value.parse::<IpAddr>())
                 .transpose()?
                 .or(Some(IpAddr::from([127, 0, 0, 1])));
-            Some(crate::api::start(api_db, api_bind, api_port).await?)
+            Some(crate::api::start(api_peer_map, api_bind, api_port).await?)
         } else {
             None
         };
