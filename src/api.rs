@@ -279,6 +279,7 @@ pub(crate) async fn start(
         .route("/api/peers", get(list_peers))
         .route("/api/device-group/accessible", get(list_groups))
         .route("/api/admin/peers", get(list_admin_peers))
+        .route("/api/admin/online-devices", get(list_admin_online_devices))
         .route("/api/admin/peers/:id", put(update_peer))
         .route(
             "/api/admin/device-groups",
@@ -1857,6 +1858,59 @@ async fn list_admin_peers(
     peers_response(&state.db, &state.peer_map, query, None, group_ids).await
 }
 
+async fn list_admin_online_devices(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<Pagination>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin_session(&state, &headers).await?;
+    let current = query.current.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(100).clamp(1, 200);
+    let online = state.peer_map.online_peer_ids().await;
+    let online_seconds = online
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashMap<_, _>>();
+    let online_ids = online.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    let (peers, total) = state
+        .db
+        .list_peers_by_ids(
+            &online_ids,
+            page_size,
+            current.saturating_sub(1).saturating_mul(page_size),
+        )
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list live online devices: {}", error);
+            ApiError::internal()
+        })?;
+    let data = peers
+        .into_iter()
+        .map(|peer| {
+            let user = peer
+                .user
+                .as_deref()
+                .map(String::from_utf8_lossy)
+                .unwrap_or_default()
+                .into_owned();
+            json!({
+                "id": peer.id,
+                "info": serde_json::from_str::<Value>(&peer.info).unwrap_or_else(|_| json!({})),
+                "user": user,
+                "note": peer.note,
+                "last_seen_seconds": online_seconds.get(&peer.id).copied().unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "data": data,
+        "total": total,
+        "current": current,
+        "pageSize": page_size,
+        "observation": "hbbs registration within the last 30 seconds; this is not an active remote session",
+    })))
+}
+
 async fn list_admin_audit_logs(
     Extension(state): Extension<ApiState>,
     headers: HeaderMap,
@@ -3145,6 +3199,87 @@ mod tests {
         assert_eq!(status["resources"]["online_devices"], 1);
         assert_eq!(status["resources"]["device_groups"], 1);
         assert_eq!(status["resources"]["user_groups"], 1);
+    }
+
+    #[test]
+    fn online_device_monitor_is_admin_only_and_excludes_stale_registrations() {
+        online_device_monitor_api_flow();
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    async fn online_device_monitor_api_flow() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(file.path().to_str().unwrap()).await.unwrap();
+        db.create_user(
+            "admin",
+            "Admin",
+            "admin@example.com",
+            &hash("admin-test-password", DEFAULT_COST).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        db.insert_peer("online-device", b"online-uuid", b"online-key", "{}")
+            .await
+            .unwrap();
+        db.insert_peer("stale-device", b"stale-uuid", b"stale-key", "{}")
+            .await
+            .unwrap();
+        let peer_map = PeerMap::with_database(db.clone());
+        peer_map
+            .get_or("online-device")
+            .await
+            .write()
+            .await
+            .last_reg_time = Instant::now();
+        peer_map
+            .get_or("stale-device")
+            .await
+            .write()
+            .await
+            .last_reg_time = Instant::now() - std::time::Duration::from_secs(31);
+        let state = ApiState {
+            db,
+            jwt_secret: "online-device-test-secret".to_owned(),
+            peer_map,
+            started_at: Instant::now(),
+            api_address: "127.0.0.1:21114".parse().unwrap(),
+            rendezvous_address: "127.0.0.1:21116".parse().unwrap(),
+            relay_servers: Vec::new(),
+        };
+        assert_eq!(
+            list_admin_online_devices(
+                Extension(state.clone()),
+                HeaderMap::new(),
+                Query(Pagination {
+                    current: Some(1),
+                    page_size: Some(100),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::UNAUTHORIZED
+        );
+        let response = list_admin_online_devices(
+            Extension(state.clone()),
+            signed_test_headers(&state, "admin"),
+            Query(Pagination {
+                current: Some(1),
+                page_size: Some(100),
+                status: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response["total"], 1);
+        assert_eq!(response["data"][0]["id"], "online-device");
+        assert_eq!(
+            response["observation"],
+            "hbbs registration within the last 30 seconds; this is not an active remote session"
+        );
     }
 
     #[test]

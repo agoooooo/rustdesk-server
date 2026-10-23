@@ -186,16 +186,27 @@ impl PeerMap {
     }
 
     pub(crate) async fn online_count(&self) -> usize {
-        let peers = self.map.read().await.values().cloned().collect::<Vec<_>>();
-        let mut count = 0;
-        for peer in peers {
-            if peer.read().await.last_reg_time.elapsed().as_millis()
-                < crate::rendezvous_server::REG_TIMEOUT as u128
-            {
-                count += 1;
+        self.online_peer_ids().await.len()
+    }
+
+    pub(crate) async fn online_peer_ids(&self) -> Vec<(String, u64)> {
+        let peers = self
+            .map
+            .read()
+            .await
+            .iter()
+            .map(|(id, peer)| (id.clone(), peer.clone()))
+            .collect::<Vec<_>>();
+        let mut online = Vec::new();
+        for (id, peer) in peers {
+            let last_reg_time = peer.read().await.last_reg_time;
+            let elapsed_ms = last_reg_time.elapsed().as_millis();
+            if elapsed_ms < crate::rendezvous_server::REG_TIMEOUT as u128 {
+                online.push((id, (elapsed_ms / 1000) as u64));
             }
         }
-        count
+        online.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        online
     }
 
     #[inline]

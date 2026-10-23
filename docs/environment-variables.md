@@ -167,6 +167,7 @@ Relevant endpoints:
 | `PUT /api/admin/peers/:id` | Administrator or scoped `devices:write` role | Delegated writes may change notes only, and only while the device remains in scope; ownership cannot be changed. |
 | `GET /api/admin/audit-logs` | Administrator | List successful management mutations; supports `current`, `pageSize`, `actor`, `action`, and `resourceType` filters. |
 | `GET /api/admin/server-status` | Administrator session | Read server version, listener addresses, configured relay endpoints, uptime, and persisted/online resource counts. |
+| `GET /api/admin/online-devices` | Administrator session | Paginated devices registered with hbbs within the last 30 seconds; not remote session data. |
 | `GET /api/admin/api-tokens` | Administrator session | List the current administrator's token metadata; secret values are never returned. |
 | `POST /api/admin/api-tokens` | Administrator session | Create a scoped token; body: `{"name":"automation","scopes":["users:read"],"expiresInDays":90}`. The response contains the secret once. |
 | `DELETE /api/admin/api-tokens/:id` | Token owner administrator session | Revoke the current administrator's token immediately. |

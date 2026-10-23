@@ -423,6 +423,36 @@ impl Database {
         Ok((peers, total))
     }
 
+    pub async fn list_peers_by_ids(
+        &self,
+        ids: &[String],
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<Peer>, i64)> {
+        if ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let encoded_ids = serde_json::to_string(ids)?;
+        let mut conn = self.pool.get().await?;
+        let peers = sqlx::query_as::<_, Peer>(
+            "select guid, id, uuid, pk, user, status, info, coalesce(note, '') as note \
+             from peer where id in (select value from json_each(?)) \
+             order by id limit ? offset ?",
+        )
+        .bind(&encoded_ids)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        let total = sqlx::query_scalar::<_, i64>(
+            "select count(*) from peer where id in (select value from json_each(?))",
+        )
+        .bind(encoded_ids)
+        .fetch_one(conn.deref_mut())
+        .await?;
+        Ok((peers, total))
+    }
+
     pub async fn claim_peer(&self, id: &str, uuid: &[u8], owner: &str) -> ResultType<bool> {
         let owner = owner.as_bytes();
         let result = sqlx::query(
