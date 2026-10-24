@@ -73,7 +73,9 @@ server registration; an already-owned device cannot be claimed by another
 account. Administrators can assign, unassign, and annotate registered devices.
 Device list responses include an `online` boolean derived from hbbs's in-memory
 registration timestamp; a device is online while its last registration is
-within 30 seconds. This is live presence, not an active remote-control session.
+within 30 seconds. The `ip` field contains the device's current registration
+source IP while online and is empty while offline. This is live presence, not
+an active remote-control session.
 The first administrator is bootstrapped from `ADMIN_USER` /
 `ADMIN_PASSWORD`; there is no public registration endpoint. User accounts are
 stored in the existing SQLite database with bcrypt password hashes. Access
