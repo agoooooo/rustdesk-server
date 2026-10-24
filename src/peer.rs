@@ -185,6 +185,16 @@ impl PeerMap {
         online
     }
 
+    pub(crate) async fn online_ip(&self, id: &str) -> Option<String> {
+        let peer = self.get_in_memory(id).await?;
+        let peer = peer.read().await;
+        if peer.last_reg_time.elapsed().as_millis() >= crate::rendezvous_server::REG_TIMEOUT as u128
+        {
+            return None;
+        }
+        Some(peer.info.ip.clone())
+    }
+
     pub(crate) async fn online_count(&self) -> usize {
         self.online_peer_ids().await.len()
     }

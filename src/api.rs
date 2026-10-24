@@ -2566,11 +2566,13 @@ async fn peers_response(
             .into_owned();
         let info = serde_json::from_str::<Value>(&peer.info).unwrap_or_else(|_| json!({}));
         let online = peer_map.is_online(&peer.id).await;
+        let ip = peer_map.online_ip(&peer.id).await.unwrap_or_default();
         data.push(json!({
             "id": peer.id,
             "info": info,
             "status": peer.status.unwrap_or(1),
             "online": online,
+            "ip": ip,
             "user": user,
             "user_name": user,
             "device_group_name": "",
@@ -5206,12 +5208,12 @@ mod tests {
             .await
             .unwrap();
         let peer_map = PeerMap::with_database(db.clone());
-        peer_map
-            .get_or("test-device")
-            .await
-            .write()
-            .await
-            .last_reg_time = std::time::Instant::now();
+        {
+            let peer = peer_map.get_or("test-device").await;
+            let mut peer = peer.write().await;
+            peer.last_reg_time = std::time::Instant::now();
+            peer.info.ip = "192.0.2.10".to_owned();
+        }
         let state = ApiState {
             db: db.clone(),
             jwt_secret: "test-secret".to_owned(),
@@ -5272,6 +5274,32 @@ mod tests {
         assert_eq!(peers["data"][0]["id"], "test-device");
         assert_eq!(peers["data"][0]["user"], "alice");
         assert_eq!(peers["data"][0]["online"], true);
+        assert_eq!(peers["data"][0]["ip"], "192.0.2.10");
+        {
+            let peer = state.peer_map.get_or("test-device").await;
+            peer.write().await.last_reg_time = Instant::now() - std::time::Duration::from_secs(60);
+        }
+        let offline_peers = list_peers(
+            Extension(state.clone()),
+            headers.clone(),
+            Query(Pagination {
+                current: Some(1),
+                page_size: Some(100),
+                status: Some(1),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(offline_peers["data"][0]["online"], false);
+        assert_eq!(offline_peers["data"][0]["ip"], "");
+        state
+            .peer_map
+            .get_or("test-device")
+            .await
+            .write()
+            .await
+            .last_reg_time = Instant::now();
         assert_eq!(
             list_groups(
                 Extension(state.clone()),
