@@ -3033,6 +3033,7 @@ async fn authenticated_user(state: &ApiState, headers: &HeaderMap) -> Result<Use
     }
     let mut validation = Validation::default();
     validation.required_spec_claims.remove("exp");
+    validation.validate_exp = false;
     let claims = decode::<Claims>(
         token,
         &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
@@ -5274,6 +5275,28 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(current.name, "alice");
+        let expired_token = encode(
+            &Header::default(),
+            &Claims {
+                sub: "alice".to_owned(),
+                exp: Some(0),
+            },
+            &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        )
+        .unwrap();
+        let mut expired_headers = HeaderMap::new();
+        expired_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("access_token {expired_token}").parse().unwrap(),
+        );
+        assert_eq!(
+            current_user(Extension(state.clone()), expired_headers)
+                .await
+                .unwrap()
+                .0
+                .name,
+            "alice"
+        );
         let peers = list_peers(
             Extension(state.clone()),
             headers.clone(),
