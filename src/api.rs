@@ -489,11 +489,26 @@ async fn login(
                 log::error!("Failed to verify login device: {}", error);
                 ApiError::internal()
             })?;
-            let message = match peer {
-                Some(peer) if peer.uuid == uuid => "Device belongs to another account",
-                _ => "Device identity is not registered on this server",
-            };
-            return Err(ApiError::new(StatusCode::FORBIDDEN, message));
+            match peer {
+                Some(peer) if peer.uuid == uuid => {
+                    return Err(ApiError::new(
+                        StatusCode::FORBIDDEN,
+                        "Device belongs to another account",
+                    ));
+                }
+                Some(_) => {
+                    return Err(ApiError::new(
+                        StatusCode::FORBIDDEN,
+                        "Device identity is not registered on this server",
+                    ));
+                }
+                None => {
+                    log::debug!(
+                        "Login device {} is not registered yet; skipping device ownership claim",
+                        request.id
+                    );
+                }
+            }
         }
     }
     let token = encode(
@@ -5260,6 +5275,44 @@ mod tests {
         assert!(response["user"]["id"].is_number());
         assert_eq!(response["user"]["name"], "alice");
         assert!(response["user"].get("password_hash").is_none());
+        assert_eq!(
+            db.get_peer("test-device").await.unwrap().unwrap().user,
+            Some(b"alice".to_vec())
+        );
+
+        let unregistered_login = login(
+            Extension(state.clone()),
+            Json(LoginRequest {
+                username: "alice".to_owned(),
+                password: "a-long-test-password".to_owned(),
+                id: "not-yet-registered".to_owned(),
+                uuid: base64::encode(b"not-yet-registered-uuid"),
+                device_info: Value::Null,
+                auto_login: true,
+                r#type: "account".to_owned(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(unregistered_login["type"], "access_token");
+        assert!(db.get_peer("not-yet-registered").await.unwrap().is_none());
+
+        let mismatched_identity = login(
+            Extension(state.clone()),
+            Json(LoginRequest {
+                username: "alice".to_owned(),
+                password: "a-long-test-password".to_owned(),
+                id: "test-device".to_owned(),
+                uuid: base64::encode(b"wrong-device-uuid"),
+                device_info: Value::Null,
+                auto_login: true,
+                r#type: "account".to_owned(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatched_identity.status, StatusCode::FORBIDDEN);
         assert_eq!(
             db.get_peer("test-device").await.unwrap().unwrap().user,
             Some(b"alice".to_vec())
