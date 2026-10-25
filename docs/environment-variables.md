@@ -79,7 +79,10 @@ an active remote-control session.
 The first administrator is bootstrapped from `ADMIN_USER` /
 `ADMIN_PASSWORD`; there is no public registration endpoint. User accounts are
 stored in the existing SQLite database with bcrypt password hashes. Access
-tokens expire after eight hours.
+tokens do not expire. Client logout clears the local token but does not revoke
+it server-side; disable the account to invalidate all of its access tokens.
+Protect token storage and the SQLite database, which contains the signing
+secret.
 
 Device groups can be created and managed by administrators, with devices
 assigned to groups. The authenticated accessible-group endpoint lists groups

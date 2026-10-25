@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 use tower_http::cors::CorsLayer;
 
@@ -37,7 +37,8 @@ struct ApiState {
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     sub: String,
-    exp: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exp: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -495,16 +496,11 @@ async fn login(
             return Err(ApiError::new(StatusCode::FORBIDDEN, message));
         }
     }
-    let expires_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ApiError::internal())?
-        .as_secs() as usize
-        + 8 * 60 * 60;
     let token = encode(
         &Header::default(),
         &Claims {
             sub: user.name.clone(),
-            exp: expires_at,
+            exp: None,
         },
         &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
     )
@@ -3035,10 +3031,12 @@ async fn authenticated_user(state: &ApiState, headers: &HeaderMap) -> Result<Use
             "API tokens are limited to scoped administrator endpoints",
         ));
     }
+    let mut validation = Validation::default();
+    validation.required_spec_claims.remove("exp");
     let claims = decode::<Claims>(
         token,
         &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
-        &Validation::default(),
+        &validation,
     )
     .map_err(|_| ApiError::new(StatusCode::UNAUTHORIZED, "Invalid access token"))?
     .claims;
@@ -3129,6 +3127,7 @@ fn database_write_error(error: hbb_common::anyhow::Error) -> ApiError {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn validates_user_fields() {
@@ -5131,11 +5130,13 @@ mod tests {
             &Header::default(),
             &Claims {
                 sub: username.to_owned(),
-                exp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as usize
-                    + 3600,
+                exp: Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as usize
+                        + 3600,
+                ),
             },
             &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
         )
@@ -5153,11 +5154,13 @@ mod tests {
             &Header::default(),
             &Claims {
                 sub: username.to_owned(),
-                exp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as usize
-                    + 3600,
+                exp: Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as usize
+                        + 3600,
+                ),
             },
             &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
         )
@@ -5240,6 +5243,19 @@ mod tests {
         .0;
         let token = response["access_token"].as_str().unwrap();
         assert_eq!(response["type"], "access_token");
+        assert!(decode::<Claims>(
+            token,
+            &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
+            &{
+                let mut validation = Validation::default();
+                validation.required_spec_claims.remove("exp");
+                validation
+            },
+        )
+        .unwrap()
+        .claims
+        .exp
+        .is_none());
         assert!(response["user"]["id"].is_number());
         assert_eq!(response["user"]["name"], "alice");
         assert!(response["user"].get("password_hash").is_none());
@@ -5356,11 +5372,13 @@ mod tests {
             &Header::default(),
             &Claims {
                 sub: "bob".to_owned(),
-                exp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as usize
-                    + 3600,
+                exp: Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as usize
+                        + 3600,
+                ),
             },
             &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
         )
@@ -5476,7 +5494,7 @@ mod tests {
             &Header::default(),
             &Claims {
                 sub: "admin".to_owned(),
-                exp: expires_at,
+                exp: Some(expires_at),
             },
             &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
         )
