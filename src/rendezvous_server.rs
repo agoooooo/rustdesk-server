@@ -548,7 +548,10 @@ impl RendezvousServer {
                         }
                     }
                     if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+                        let result = self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+                        if result != register_pk_response::Result::OK {
+                            return send_rk_res(socket, addr, result).await;
+                        }
                     }
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {

@@ -1,6 +1,6 @@
 use crate::{
     common::{get_arg, get_arg_opt},
-    database::{AddressBookPermission, Database, DelegatedRole, User},
+    database::{AddressBookPermission, Database, DelegatedRole, PeerClaimResult, User},
     peer::PeerMap,
 };
 use axum::{
@@ -86,6 +86,12 @@ struct LoginRequest {
     #[serde(default)]
     #[allow(dead_code)]
     r#type: String,
+}
+
+#[derive(Deserialize)]
+struct DeviceIdentity {
+    id: String,
+    uuid: String,
 }
 
 #[derive(Deserialize)]
@@ -465,51 +471,7 @@ async fn login(
         ));
     }
     if !request.id.is_empty() && !request.uuid.is_empty() {
-        if request.id.trim() != request.id
-            || request.id.len() > crate::peer::MAX_PEER_ID_LEN
-            || request.uuid.len() > 512
-        {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "Invalid device identity",
-            ));
-        }
-        let uuid = base64::decode(&request.uuid)
-            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid device identity"))?;
-        let claimed = state
-            .db
-            .claim_peer(&request.id, &uuid, &user.name)
-            .await
-            .map_err(|error| {
-                log::error!("Failed to claim login device: {}", error);
-                ApiError::internal()
-            })?;
-        if !claimed {
-            let peer = state.db.get_peer(&request.id).await.map_err(|error| {
-                log::error!("Failed to verify login device: {}", error);
-                ApiError::internal()
-            })?;
-            match peer {
-                Some(peer) if peer.uuid == uuid => {
-                    return Err(ApiError::new(
-                        StatusCode::FORBIDDEN,
-                        "Device belongs to another account",
-                    ));
-                }
-                Some(_) => {
-                    return Err(ApiError::new(
-                        StatusCode::FORBIDDEN,
-                        "Device identity is not registered on this server",
-                    ));
-                }
-                None => {
-                    log::debug!(
-                        "Login device {} is not registered yet; skipping device ownership claim",
-                        request.id
-                    );
-                }
-            }
-        }
+        claim_or_defer_login_device(&state.db, &request.id, &request.uuid, &user.name).await?;
     }
     let token = encode(
         &Header::default(),
@@ -529,6 +491,44 @@ async fn login(
         "access_token": token,
         "user": user_payload,
     })))
+}
+
+async fn claim_or_defer_login_device(
+    db: &Database,
+    id: &str,
+    encoded_uuid: &str,
+    owner: &str,
+) -> Result<(), ApiError> {
+    if id.trim() != id || id.len() > crate::peer::MAX_PEER_ID_LEN || encoded_uuid.len() > 512 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid device identity",
+        ));
+    }
+    let uuid = base64::decode(encoded_uuid)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid device identity"))?;
+    let claim_result = db
+        .claim_or_defer_peer(id, &uuid, owner)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to claim or defer login device: {}", error);
+            ApiError::internal()
+        })?;
+    match claim_result {
+        PeerClaimResult::Claimed | PeerClaimResult::Pending => Ok(()),
+        PeerClaimResult::OwnedByAnotherAccount => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Device belongs to another account",
+        )),
+        PeerClaimResult::IdentityMismatch => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Device identity is not registered on this server",
+        )),
+        PeerClaimResult::PendingForAnotherAccount => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Device is pending registration for another account",
+        )),
+    }
 }
 
 async fn login_options() -> Json<Vec<String>> {
@@ -566,8 +566,15 @@ async fn register_user(
 async fn current_user(
     Extension(state): Extension<ApiState>,
     headers: HeaderMap,
+    request: Option<Json<DeviceIdentity>>,
 ) -> Result<Json<UserPayload>, ApiError> {
     let user = authenticated_user(&state, &headers).await?;
+    if let Some(Json(identity)) = request {
+        if !identity.id.is_empty() && !identity.uuid.is_empty() {
+            claim_or_defer_login_device(&state.db, &identity.id, &identity.uuid, &user.name)
+                .await?;
+        }
+    }
     let user_payload = user_payload_with_delegated_permissions(&state, user).await?;
     Ok(Json(user_payload))
 }
@@ -3539,14 +3546,14 @@ mod tests {
             json!(["devices:read", "devices:write", "users:read", "users:write"])
         );
         assert!(
-            current_user(Extension(state.clone()), delegated_headers.clone())
+            current_user(Extension(state.clone()), delegated_headers.clone(), None)
                 .await
                 .unwrap()
                 .0
                 .is_delegated_admin
         );
         assert_eq!(
-            current_user(Extension(state.clone()), delegated_headers.clone())
+            current_user(Extension(state.clone()), delegated_headers.clone(), None)
                 .await
                 .unwrap()
                 .0
@@ -5280,13 +5287,15 @@ mod tests {
             Some(b"alice".to_vec())
         );
 
+        let pending_device_id = "not-yet-registered";
+        let pending_device_uuid = b"not-yet-registered-uuid";
         let unregistered_login = login(
             Extension(state.clone()),
             Json(LoginRequest {
                 username: "alice".to_owned(),
                 password: "a-long-test-password".to_owned(),
-                id: "not-yet-registered".to_owned(),
-                uuid: base64::encode(b"not-yet-registered-uuid"),
+                id: pending_device_id.to_owned(),
+                uuid: base64::encode(pending_device_uuid),
                 device_info: Value::Null,
                 auto_login: true,
                 r#type: "account".to_owned(),
@@ -5323,10 +5332,17 @@ mod tests {
             axum::http::header::AUTHORIZATION,
             format!("Bearer {token}").parse().unwrap(),
         );
-        let current = current_user(Extension(state.clone()), headers.clone())
-            .await
-            .unwrap()
-            .0;
+        let current = current_user(
+            Extension(state.clone()),
+            headers.clone(),
+            Some(Json(DeviceIdentity {
+                id: "test-device".to_owned(),
+                uuid: base64::encode(device_uuid),
+            })),
+        )
+        .await
+        .unwrap()
+        .0;
         assert_eq!(current.name, "alice");
         let expired_token = encode(
             &Header::default(),
@@ -5343,7 +5359,7 @@ mod tests {
             format!("access_token {expired_token}").parse().unwrap(),
         );
         assert_eq!(
-            current_user(Extension(state.clone()), expired_headers)
+            current_user(Extension(state.clone()), expired_headers, None)
                 .await
                 .unwrap()
                 .0
@@ -5444,6 +5460,22 @@ mod tests {
             .create_user("bob", "Bob", "bob@example.com", &bob_password_hash, false)
             .await
             .unwrap();
+        let pending_claim_denied = login(
+            Extension(state.clone()),
+            Json(LoginRequest {
+                username: "bob".to_owned(),
+                password: "another-long-test-password".to_owned(),
+                id: pending_device_id.to_owned(),
+                uuid: base64::encode(pending_device_uuid),
+                device_info: Value::Null,
+                auto_login: true,
+                r#type: "account".to_owned(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(pending_claim_denied.status, StatusCode::FORBIDDEN);
+
         let bob_token = encode(
             &Header::default(),
             &Claims {
@@ -5521,6 +5553,65 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(denied.status, StatusCode::FORBIDDEN);
+
+        let existing_session_uuid = b"existing-session-uuid";
+        state
+            .db
+            .insert_peer(
+                "existing-session-device",
+                existing_session_uuid,
+                b"existing-session-key",
+                "{}",
+            )
+            .await
+            .unwrap();
+        current_user(
+            Extension(state.clone()),
+            headers.clone(),
+            Some(Json(DeviceIdentity {
+                id: "existing-session-device".to_owned(),
+                uuid: base64::encode(existing_session_uuid),
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .db
+                .get_peer("existing-session-device")
+                .await
+                .unwrap()
+                .unwrap()
+                .user,
+            Some(b"alice".to_vec())
+        );
+
+        let mut peer_map = PeerMap::with_database(state.db.clone());
+        let peer = peer_map.get_or(pending_device_id).await;
+        let registration_result = peer_map
+            .update_pk(
+                pending_device_id.to_owned(),
+                peer,
+                "192.0.2.20:21116".parse().unwrap(),
+                hbb_common::bytes::Bytes::copy_from_slice(pending_device_uuid),
+                hbb_common::bytes::Bytes::from_static(b"new-device-key"),
+                "192.0.2.20".to_owned(),
+            )
+            .await;
+        assert_eq!(
+            registration_result,
+            hbb_common::rendezvous_proto::register_pk_response::Result::OK
+        );
+        assert_eq!(
+            state
+                .db
+                .get_peer(pending_device_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .user,
+            Some(b"alice".to_vec())
+        );
 
         let error = list_admin_users(
             Extension(state),

@@ -49,6 +49,15 @@ pub struct Peer {
     pub note: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum PeerClaimResult {
+    Claimed,
+    Pending,
+    OwnedByAnotherAccount,
+    IdentityMismatch,
+    PendingForAnotherAccount,
+}
+
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct User {
     pub id: i64,
@@ -203,6 +212,16 @@ impl Database {
             create index if not exists index_peer_status on peer (status);
 
         "
+        )
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        sqlx::query(
+            "create table if not exists pending_peer_claims (
+                id varchar(253) primary key not null,
+                uuid blob not null,
+                user blob not null,
+                created_at datetime not null default(current_timestamp)
+            ) without rowid;",
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
@@ -453,19 +472,71 @@ impl Database {
         Ok((peers, total))
     }
 
-    pub async fn claim_peer(&self, id: &str, uuid: &[u8], owner: &str) -> ResultType<bool> {
+    pub async fn claim_or_defer_peer(
+        &self,
+        id: &str,
+        uuid: &[u8],
+        owner: &str,
+    ) -> ResultType<PeerClaimResult> {
         let owner = owner.as_bytes();
-        let result = sqlx::query(
-            "update peer set user = ? \
-             where id = ? and uuid = ? and (user is null or user = ?)",
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let peer = sqlx::query_as::<_, (Vec<u8>, Option<Vec<u8>>)>(
+            "select uuid, user from peer where id = ?",
         )
-        .bind(owner)
         .bind(id)
-        .bind(uuid)
-        .bind(owner)
-        .execute(self.pool.get().await?.deref_mut())
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let result = if let Some((registered_uuid, registered_owner)) = peer {
+            if registered_uuid != uuid {
+                PeerClaimResult::IdentityMismatch
+            } else if let Some(registered_owner) = registered_owner {
+                if registered_owner == owner {
+                    PeerClaimResult::Claimed
+                } else {
+                    PeerClaimResult::OwnedByAnotherAccount
+                }
+            } else {
+                sqlx::query("update peer set user = ? where id = ? and uuid = ? and user is null")
+                    .bind(owner)
+                    .bind(id)
+                    .bind(uuid)
+                    .execute(&mut *tx)
+                    .await?;
+                PeerClaimResult::Claimed
+            }
+        } else {
+            let pending_owner = sqlx::query_scalar::<_, Vec<u8>>(
+                "select user from pending_peer_claims where id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            match pending_owner {
+                Some(pending_owner) if pending_owner != owner => {
+                    PeerClaimResult::PendingForAnotherAccount
+                }
+                Some(_) => {
+                    sqlx::query("update pending_peer_claims set uuid = ? where id = ?")
+                        .bind(uuid)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    PeerClaimResult::Pending
+                }
+                None => {
+                    sqlx::query("insert into pending_peer_claims(id, uuid, user) values(?, ?, ?)")
+                        .bind(id)
+                        .bind(uuid)
+                        .bind(owner)
+                        .execute(&mut *tx)
+                        .await?;
+                    PeerClaimResult::Pending
+                }
+            }
+        };
+        tx.commit().await?;
+        Ok(result)
     }
 
     pub async fn update_peer_owner(
@@ -491,16 +562,31 @@ impl Database {
         info: &str,
     ) -> ResultType<Vec<u8>> {
         let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
-        sqlx::query!(
-            "insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)",
-            guid,
-            id,
-            uuid,
-            pk,
-            info
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let owner = sqlx::query_scalar::<_, Vec<u8>>(
+            "select pending.user from pending_peer_claims pending \
+             join users on cast(users.name as blob) = pending.user and users.status = 1 \
+             where pending.id = ? and pending.uuid = ?",
         )
-        .execute(self.pool.get().await?.deref_mut())
+        .bind(id)
+        .bind(uuid)
+        .fetch_optional(&mut *tx)
         .await?;
+        sqlx::query("insert into peer(guid, id, uuid, pk, user, info) values(?, ?, ?, ?, ?, ?)")
+            .bind(&guid)
+            .bind(id)
+            .bind(uuid)
+            .bind(pk)
+            .bind(owner)
+            .bind(info)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from pending_peer_claims where id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(guid)
     }
 
@@ -508,18 +594,33 @@ impl Database {
         &self,
         guid: &Vec<u8>,
         id: &str,
+        uuid: &[u8],
         pk: &[u8],
         info: &str,
     ) -> ResultType<()> {
-        sqlx::query!(
-            "update peer set id=?, pk=?, info=? where guid=?",
-            id,
-            pk,
-            info,
-            guid
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        sqlx::query(
+            "update peer set id = ?, pk = ?, info = ?, \
+             user = coalesce(user, ( \
+                 select pending.user from pending_peer_claims pending \
+                 join users on cast(users.name as blob) = pending.user and users.status = 1 \
+                 where pending.id = ? and pending.uuid = ? \
+             )) where guid = ?",
         )
-        .execute(self.pool.get().await?.deref_mut())
+        .bind(id)
+        .bind(pk)
+        .bind(info)
+        .bind(id)
+        .bind(uuid)
+        .bind(guid)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query("delete from pending_peer_claims where id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -911,6 +1012,7 @@ impl Database {
         is_admin: bool,
         status: i64,
     ) -> ResultType<()> {
+        let mut conn = self.pool.get().await?;
         sqlx::query(
             "update users set display_name = ?, email = ?, is_admin = ?, status = ? where id = ?",
         )
@@ -919,8 +1021,17 @@ impl Database {
         .bind(is_admin)
         .bind(status)
         .bind(id)
-        .execute(self.pool.get().await?.deref_mut())
+        .execute(conn.deref_mut())
         .await?;
+        if status == 0 {
+            sqlx::query(
+                "delete from pending_peer_claims \
+                 where user = cast((select name from users where id = ?) as blob)",
+            )
+            .bind(id)
+            .execute(conn.deref_mut())
+            .await?;
+        }
         Ok(())
     }
 
@@ -941,6 +1052,10 @@ impl Database {
             .await?;
         if let Some(name) = name {
             sqlx::query("update peer set user = null where user = ?")
+                .bind(name.as_bytes())
+                .execute(conn.deref_mut())
+                .await?;
+            sqlx::query("delete from pending_peer_claims where user = ?")
                 .bind(name.as_bytes())
                 .execute(conn.deref_mut())
                 .await?;

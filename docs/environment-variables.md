@@ -68,12 +68,14 @@ Set `API_ENABLED=Y` to expose an account API on `API_BIND:API_PORT`. It supports
 RustDesk account login and current-user lookup, authenticated user and
 account-owned device listing for clients, and administrator-only user and device
 management under `/api/admin`. Account login succeeds even if the client device
-has not registered with hbbs yet; in that case login does not claim or list the
-device. A registered device is bound to the account only when the supplied
-device ID and base64 UUID match the existing server registration, and an
-already-owned device cannot be claimed by another account. To bind a device
-that registers after login, sign in again after its first hbbs registration.
-Administrators can assign, unassign, and annotate registered devices.
+has not registered with hbbs yet; the server records a pending claim and binds
+the device automatically when its first registration matches the supplied
+device ID and base64 UUID. A registered device is bound only when both values
+match the existing server registration, and an already-owned or pending device
+cannot be claimed by another account. Administrators can assign, unassign, and
+annotate registered devices. Clients also send their identity on current-user
+refresh, allowing already-signed-in clients to claim newly registered devices
+without logging in again.
 Device list responses include an `online` boolean derived from hbbs's in-memory
 registration timestamp; a device is online while its last registration is
 within 30 seconds. The `ip` field contains the device's current registration

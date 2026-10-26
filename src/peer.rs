@@ -103,35 +103,33 @@ impl PeerMap {
         ip: String,
     ) -> register_pk_response::Result {
         log::info!("update_pk {} {:?} {:?} {:?}", id, addr, uuid, pk);
-        let (info_str, guid) = {
-            let mut w = peer.write().await;
-            w.socket_addr = addr;
-            w.uuid = uuid.clone();
-            w.pk = pk.clone();
-            w.last_reg_time = Instant::now();
-            w.info.ip = ip;
-            (
-                serde_json::to_string(&w.info).unwrap_or_default(),
-                w.guid.clone(),
-            )
-        };
-        if guid.is_empty() {
+        let mut w = peer.write().await;
+        let guid = w.guid.clone();
+        let mut info = w.info.clone();
+        info.ip = ip.clone();
+        let info_str = serde_json::to_string(&info).unwrap_or_default();
+        let guid = if guid.is_empty() {
             match self.db.insert_peer(&id, &uuid, &pk, &info_str).await {
                 Err(err) => {
                     log::error!("db.insert_peer failed: {}", err);
                     return register_pk_response::Result::SERVER_ERROR;
                 }
-                Ok(guid) => {
-                    peer.write().await.guid = guid;
-                }
+                Ok(guid) => guid,
             }
         } else {
-            if let Err(err) = self.db.update_pk(&guid, &id, &pk, &info_str).await {
+            if let Err(err) = self.db.update_pk(&guid, &id, &uuid, &pk, &info_str).await {
                 log::error!("db.update_pk failed: {}", err);
                 return register_pk_response::Result::SERVER_ERROR;
             }
             log::info!("pk updated instead of insert");
-        }
+            guid
+        };
+        w.socket_addr = addr;
+        w.uuid = uuid;
+        w.pk = pk;
+        w.last_reg_time = Instant::now();
+        w.info = info;
+        w.guid = guid;
         register_pk_response::Result::OK
     }
 
