@@ -95,6 +95,7 @@ test("server script recovers missing PID files and stops daemons with deleted bi
   });
   assert.equal(started.status, 0, started.stderr);
   assert.match(started.stdout, new RegExp(`hbbs 已在运行 \\(PID ${daemons[0].pid}\\)`));
+  assert.match(started.stdout, /TCP 密钥交换: Y/);
   for (const [index, name] of ["hbbs", "hbbr"].entries()) {
     assert.equal(
       fs.readFileSync(path.join(run, `${name}.pid`), "utf8").trim(),

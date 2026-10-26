@@ -65,6 +65,11 @@ Run `./start.sh` from the repository to build (if needed) and start `hbbs` and
 ports, and data/log locations. Use `./start.sh status` to check the services
 and `./start.sh stop` to stop them.
 
+The script enables `TCP_KEY_EXCHANGE` by default so current clients can secure
+TCP rendezvous sessions. Set `TCP_KEY_EXCHANGE=N` when starting the script to
+disable it for compatibility with a deployment that requires the legacy
+behavior.
+
 The default listener binds to all interfaces and the script detects a local
 LAN address. A LAN address is not reachable from the public internet. For
 internet access, set `SERVER_ADDR` to a public IP or domain that resolves to

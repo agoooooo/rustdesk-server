@@ -37,6 +37,8 @@ discover_server_addr() {
 }
 
 SERVER_ADDR="${SERVER_ADDR:-$(discover_server_addr)}"
+TCP_KEY_EXCHANGE="${TCP_KEY_EXCHANGE:-Y}"
+export TCP_KEY_EXCHANGE
 
 pid_file() {
     printf '%s/%s.pid' "$RUN_DIR" "$1"
@@ -114,6 +116,7 @@ show_config() {
     fi
     printf 'ID/Rendezvous: %s\n' "$SERVER_ADDR"
     printf 'Relay: %s:21117\n' "$SERVER_ADDR"
+    printf 'TCP 密钥交换: %s\n' "$TCP_KEY_EXCHANGE"
     printf '端口: TCP 21115-21119；UDP 21116\n'
     printf '监听地址: %s\n' "$BIND_ADDRESS"
     printf '数据目录: %s\n' "$DATA_DIR"
