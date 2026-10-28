@@ -1,6 +1,8 @@
 use crate::{
     common::{get_arg, get_arg_opt},
-    database::{AddressBookPermission, Database, DelegatedRole, PeerClaimResult, User},
+    database::{
+        AddressBookPermission, AutomationTask, Database, DelegatedRole, PeerClaimResult, User,
+    },
     peer::PeerMap,
 };
 use axum::{
@@ -117,6 +119,46 @@ struct AuditLogQuery {
     actor: Option<String>,
     action: Option<String>,
     resource_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomationTaskQuery {
+    current: Option<i64>,
+    page_size: Option<i64>,
+    task_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomationTaskRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    script: Value,
+    #[serde(default)]
+    published: bool,
+    #[serde(default)]
+    interval_seconds: i64,
+    #[serde(default = "default_task_max_runs")]
+    max_runs: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomationDeviceIdentity {
+    id: String,
+    uuid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomationExecutionResult {
+    id: String,
+    uuid: String,
+    status: String,
+    #[serde(default)]
+    result: String,
 }
 
 #[derive(Deserialize)]
@@ -364,6 +406,27 @@ pub(crate) async fn start(
             put(update_admin_delegated_role).delete(delete_admin_delegated_role),
         )
         .route("/api/admin/audit-logs", get(list_admin_audit_logs))
+        .route(
+            "/api/admin/tasks",
+            get(list_admin_automation_tasks).post(create_automation_task),
+        )
+        .route(
+            "/api/admin/tasks/:id",
+            put(update_automation_task).delete(delete_automation_task),
+        )
+        .route(
+            "/api/admin/task-executions",
+            get(list_admin_automation_executions),
+        )
+        .route("/api/tasks", get(list_available_automation_tasks))
+        .route(
+            "/api/tasks/:id/executions",
+            post(start_automation_execution),
+        )
+        .route(
+            "/api/tasks/executions/:execution_id/complete",
+            post(finish_automation_execution),
+        )
         .route("/api/admin/server-status", get(get_admin_server_status))
         .route(
             "/api/admin/api-tokens",
@@ -2011,6 +2074,407 @@ async fn list_admin_audit_logs(
     ))
 }
 
+fn default_task_max_runs() -> i64 {
+    1
+}
+
+fn validate_automation_task(request: &AutomationTaskRequest) -> Result<String, ApiError> {
+    let name = request.name.trim();
+    if name.is_empty()
+        || name.len() > 100
+        || request.description.len() > 500
+        || !(0..=2_592_000).contains(&request.interval_seconds)
+        || !(1..=1000).contains(&request.max_runs)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid task metadata or schedule limits",
+        ));
+    }
+
+    let steps = request
+        .script
+        .as_object()
+        .filter(|script| script.len() == 2 && script.get("version") == Some(&json!(1)))
+        .and_then(|script| script.get("steps"))
+        .and_then(Value::as_array)
+        .filter(|steps| !steps.is_empty() && steps.len() <= 50)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Script must be version 1 with 1 to 50 steps",
+            )
+        })?;
+
+    for step in steps {
+        let Some(step) = step.as_object() else {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "Invalid task step"));
+        };
+        let Some(action) = step.get("action").and_then(Value::as_str) else {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Task step action required",
+            ));
+        };
+        let valid = match action {
+            "wait" => {
+                step.len() == 2
+                    && step
+                        .get("milliseconds")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|value| (1..=30_000).contains(&value))
+            }
+            "ocr_find" | "click_text" => {
+                step.len() == 2
+                    && step
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty() && text.len() <= 200)
+            }
+            "click" => {
+                step.len() == 3
+                    && ["x", "y"].iter().all(|coordinate| {
+                        step.get(*coordinate)
+                            .and_then(Value::as_f64)
+                            .is_some_and(|value| (0.0..=1.0).contains(&value))
+                    })
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Unsupported or invalid task step",
+            ));
+        }
+    }
+    let encoded = serde_json::to_string(&request.script).map_err(|error| {
+        log::error!("Failed to serialize automation script: {}", error);
+        ApiError::internal()
+    })?;
+    if encoded.len() > 32_768 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Task script exceeds 32 KB",
+        ));
+    }
+    Ok(encoded)
+}
+
+async fn list_admin_automation_tasks(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin_session(&state, &headers).await?;
+    let tasks = state
+        .db
+        .list_automation_tasks(false)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list automation tasks: {}", error);
+            ApiError::internal()
+        })?;
+    Ok(Json(json!({ "data": tasks })))
+}
+
+async fn create_automation_task(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<AutomationTaskRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let actor = require_admin_session(&state, &headers).await?;
+    let script = validate_automation_task(&request)?;
+    let id = state
+        .db
+        .create_automation_task(
+            request.name.trim(),
+            request.description.trim(),
+            &script,
+            request.interval_seconds,
+            request.max_runs,
+            &actor.name,
+        )
+        .await
+        .map_err(|error| {
+            log::error!("Failed to create automation task: {}", error);
+            ApiError::internal()
+        })?;
+    if request.published {
+        state
+            .db
+            .update_automation_task(
+                id,
+                request.name.trim(),
+                request.description.trim(),
+                &script,
+                true,
+                request.interval_seconds,
+                request.max_runs,
+            )
+            .await
+            .map_err(|error| {
+                log::error!("Failed to publish automation task {}: {}", id, error);
+                ApiError::internal()
+            })?;
+    }
+    record_admin_audit(
+        &state,
+        &actor,
+        "create",
+        "automation_task",
+        &id.to_string(),
+        "Created an automation task",
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
+}
+
+async fn update_automation_task(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(request): Json<AutomationTaskRequest>,
+) -> Result<StatusCode, ApiError> {
+    let actor = require_admin_session(&state, &headers).await?;
+    let script = validate_automation_task(&request)?;
+    if !state
+        .db
+        .update_automation_task(
+            id,
+            request.name.trim(),
+            request.description.trim(),
+            &script,
+            request.published,
+            request.interval_seconds,
+            request.max_runs,
+        )
+        .await
+        .map_err(|error| {
+            log::error!("Failed to update automation task {}: {}", id, error);
+            ApiError::internal()
+        })?
+    {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Task not found"));
+    }
+    record_admin_audit(
+        &state,
+        &actor,
+        "update",
+        "automation_task",
+        &id.to_string(),
+        "Updated an automation task",
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_automation_task(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let actor = require_admin_session(&state, &headers).await?;
+    if !state.db.delete_automation_task(id).await.map_err(|error| {
+        log::error!("Failed to delete automation task {}: {}", id, error);
+        ApiError::internal()
+    })? {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Task not found"));
+    }
+    record_admin_audit(
+        &state,
+        &actor,
+        "delete",
+        "automation_task",
+        &id.to_string(),
+        "Deleted an automation task",
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_admin_automation_executions(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<AutomationTaskQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin_session(&state, &headers).await?;
+    let current = query.current.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 200);
+    let (data, total) = state
+        .db
+        .list_automation_executions(
+            query.task_id,
+            page_size,
+            current.saturating_sub(1).saturating_mul(page_size),
+        )
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list automation executions: {}", error);
+            ApiError::internal()
+        })?;
+    Ok(Json(
+        json!({ "data": data, "total": total, "current": current }),
+    ))
+}
+
+async fn verify_automation_device(
+    state: &ApiState,
+    headers: &HeaderMap,
+    identity: &AutomationDeviceIdentity,
+) -> Result<User, ApiError> {
+    if identity.id.trim().is_empty() || identity.id.len() > 100 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid device identity",
+        ));
+    }
+    let user = authenticated_user(state, headers).await?;
+    let uuid = base64::decode(&identity.uuid)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid device identity"))?;
+    let peer = state
+        .db
+        .get_peer(&identity.id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to verify automation device: {}", error);
+            ApiError::internal()
+        })?
+        .filter(|peer| {
+            peer.uuid == uuid
+                && peer.user.as_deref() == Some(user.name.as_bytes())
+                && peer.status != Some(0)
+        })
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::FORBIDDEN, "Device is not bound to this account")
+        })?;
+    let _ = peer;
+    Ok(user)
+}
+
+async fn list_available_automation_tasks(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Query(identity): Query<AutomationDeviceIdentity>,
+) -> Result<Json<Value>, ApiError> {
+    let user = verify_automation_device(&state, &headers, &identity).await?;
+    let tasks = state
+        .db
+        .list_automation_tasks(true)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to list published automation tasks: {}", error);
+            ApiError::internal()
+        })?;
+    let mut available_tasks = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let (used_runs, next_run_at, can_run) = state
+            .db
+            .automation_task_usage(task.id, &identity.id, task.max_runs, task.interval_seconds)
+            .await
+            .map_err(|error| {
+                log::error!("Failed to read automation task usage: {}", error);
+                ApiError::internal()
+            })?;
+        available_tasks.push(json!({
+            "id": task.id,
+            "name": task.name,
+            "description": task.description,
+            "script": serde_json::from_str::<Value>(&task.script).unwrap_or(Value::Null),
+            "intervalSeconds": task.interval_seconds,
+            "maxRuns": task.max_runs,
+            "usedRuns": used_runs,
+            "nextRunAt": next_run_at,
+            "canRun": can_run,
+        }));
+    }
+    Ok(Json(json!({ "data": available_tasks, "user": user.name })))
+}
+
+async fn start_automation_execution(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(task_id): Path<i64>,
+    Json(identity): Json<AutomationDeviceIdentity>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let user = verify_automation_device(&state, &headers, &identity).await?;
+    let task = state
+        .db
+        .get_automation_task(task_id)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to load automation task: {}", error);
+            ApiError::internal()
+        })?
+        .filter(|task| task.published)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Published task not found"))?;
+    let execution_id = state
+        .db
+        .start_automation_execution(task.id, &identity.id, &user.name)
+        .await
+        .map_err(|error| {
+            log::error!("Failed to start automation task: {}", error);
+            ApiError::internal()
+        })?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "Task run limit reached or schedule interval has not elapsed",
+            )
+        })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "executionId": execution_id })),
+    ))
+}
+
+async fn finish_automation_execution(
+    Extension(state): Extension<ApiState>,
+    headers: HeaderMap,
+    Path(execution_id): Path<i64>,
+    Json(request): Json<AutomationExecutionResult>,
+) -> Result<StatusCode, ApiError> {
+    let user = verify_automation_device(
+        &state,
+        &headers,
+        &AutomationDeviceIdentity {
+            id: request.id,
+            uuid: request.uuid,
+        },
+    )
+    .await?;
+    if !matches!(
+        request.status.as_str(),
+        "succeeded" | "failed" | "cancelled"
+    ) || request.result.len() > 4096
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid task execution result",
+        ));
+    }
+    if !state
+        .db
+        .finish_automation_execution(
+            execution_id,
+            &request.id,
+            &user.name,
+            &request.status,
+            &request.result,
+        )
+        .await
+        .map_err(|error| {
+            log::error!("Failed to finish automation execution: {}", error);
+            ApiError::internal()
+        })?
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Active task execution not found",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_admin_api_tokens(
     Extension(state): Extension<ApiState>,
     headers: HeaderMap,
@@ -3042,6 +3506,7 @@ fn valid_audit_resource_type(resource_type: &str) -> bool {
             | "address_book_entry"
             | "delegated_role"
             | "api_token"
+            | "automation_task"
     )
 }
 
@@ -3163,6 +3628,36 @@ mod tests {
         assert!(validate_email("alice@@example.com").is_err());
         assert!(validate_password("long-enough-password").is_ok());
         assert!(validate_password("short").is_err());
+    }
+
+    #[test]
+    fn automation_scripts_allow_only_bounded_mobile_actions() {
+        let valid = AutomationTaskRequest {
+            name: "Text task".to_owned(),
+            description: String::new(),
+            script: json!({
+                "version": 1,
+                "steps": [
+                    {"action": "ocr_find", "text": "Continue"},
+                    {"action": "click_text", "text": "Continue"},
+                    {"action": "click", "x": 0.5, "y": 0.4},
+                    {"action": "wait", "milliseconds": 200}
+                ]
+            }),
+            published: true,
+            interval_seconds: 60,
+            max_runs: 3,
+        };
+        assert!(validate_automation_task(&valid).is_ok());
+
+        let shell = AutomationTaskRequest {
+            script: json!({
+                "version": 1,
+                "steps": [{"action": "shell", "command": "id"}]
+            }),
+            ..valid
+        };
+        assert!(validate_automation_task(&shell).is_err());
     }
 
     #[test]

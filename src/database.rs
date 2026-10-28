@@ -127,6 +127,31 @@ pub struct AuditLog {
 }
 
 #[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+pub struct AutomationTask {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub script: String,
+    pub published: bool,
+    pub interval_seconds: i64,
+    pub max_runs: i64,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+pub struct AutomationExecution {
+    pub id: i64,
+    pub task_id: i64,
+    pub device_id: String,
+    pub user_name: String,
+    pub status: String,
+    pub result: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
 pub struct ApiToken {
     pub id: i64,
     pub name: String,
@@ -310,6 +335,29 @@ impl Database {
                 on admin_audit_logs (created_at);
             create index if not exists index_admin_audit_logs_actor
                 on admin_audit_logs (actor_name, created_at);
+            create table if not exists automation_tasks (
+                id integer primary key autoincrement,
+                name varchar(100) not null,
+                description varchar(500) not null default '',
+                script text not null,
+                published integer not null default 0,
+                interval_seconds integer not null default 0,
+                max_runs integer not null default 1,
+                created_by varchar(64) not null,
+                created_at datetime not null default(current_timestamp)
+            );
+            create table if not exists automation_executions (
+                id integer primary key autoincrement,
+                task_id integer not null,
+                device_id varchar(100) not null,
+                user_name varchar(64) not null,
+                status varchar(20) not null,
+                result text not null default '',
+                created_at datetime not null default(current_timestamp),
+                completed_at datetime
+            );
+            create index if not exists index_automation_executions_task_device
+                on automation_executions (task_id, device_id, created_at);
             create table if not exists api_tokens (
                 id integer primary key autoincrement,
                 owner_id integer not null,
@@ -1908,6 +1956,247 @@ impl Database {
         .fetch_one(conn.deref_mut())
         .await?;
         Ok((logs, total))
+    }
+
+    pub async fn list_automation_tasks(
+        &self,
+        published_only: bool,
+    ) -> ResultType<Vec<AutomationTask>> {
+        let mut conn = self.pool.get().await?;
+        Ok(sqlx::query_as::<_, AutomationTask>(
+            "select id, name, description, script, published, interval_seconds, max_runs, \
+                    created_by, created_at \
+             from automation_tasks where (? = 0 or published = 1) order by id desc",
+        )
+        .bind(if published_only { 1i64 } else { 0i64 })
+        .fetch_all(conn.deref_mut())
+        .await?)
+    }
+
+    pub async fn get_automation_task(&self, id: i64) -> ResultType<Option<AutomationTask>> {
+        Ok(sqlx::query_as::<_, AutomationTask>(
+            "select id, name, description, script, published, interval_seconds, max_runs, \
+                    created_by, created_at from automation_tasks where id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    pub async fn create_automation_task(
+        &self,
+        name: &str,
+        description: &str,
+        script: &str,
+        interval_seconds: i64,
+        max_runs: i64,
+        created_by: &str,
+    ) -> ResultType<i64> {
+        let mut conn = self.pool.get().await?;
+        sqlx::query(
+            "insert into automation_tasks \
+             (name, description, script, interval_seconds, max_runs, created_by) \
+             values (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(description)
+        .bind(script)
+        .bind(interval_seconds)
+        .bind(max_runs)
+        .bind(created_by)
+        .execute(conn.deref_mut())
+        .await?;
+        Ok(sqlx::query_scalar("select last_insert_rowid()")
+            .fetch_one(conn.deref_mut())
+            .await?)
+    }
+
+    pub async fn update_automation_task(
+        &self,
+        id: i64,
+        name: &str,
+        description: &str,
+        script: &str,
+        published: bool,
+        interval_seconds: i64,
+        max_runs: i64,
+    ) -> ResultType<bool> {
+        let result = sqlx::query(
+            "update automation_tasks set name = ?, description = ?, script = ?, published = ?, \
+             interval_seconds = ?, max_runs = ? where id = ?",
+        )
+        .bind(name)
+        .bind(description)
+        .bind(script)
+        .bind(published)
+        .bind(interval_seconds)
+        .bind(max_runs)
+        .bind(id)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delete_automation_task(&self, id: i64) -> ResultType<bool> {
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        sqlx::query("delete from automation_executions where task_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let result = sqlx::query("delete from automation_tasks where id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn automation_task_usage(
+        &self,
+        task_id: i64,
+        device_id: &str,
+        max_runs: i64,
+        interval_seconds: i64,
+    ) -> ResultType<(i64, Option<String>, bool)> {
+        let mut conn = self.pool.get().await?;
+        let used = sqlx::query_scalar(
+            "select count(*) from automation_executions \
+             where task_id = ? and device_id = ? and status != 'cancelled'",
+        )
+        .bind(task_id)
+        .bind(device_id)
+        .fetch_one(conn.deref_mut())
+        .await?;
+        let last_started = sqlx::query_scalar(
+            "select max(created_at) from automation_executions \
+             where task_id = ? and device_id = ? and status != 'cancelled'",
+        )
+        .bind(task_id)
+        .bind(device_id)
+        .fetch_one(conn.deref_mut())
+        .await?;
+        let next_run_at = if let Some(started) = last_started.as_ref() {
+            Some(
+                sqlx::query_scalar::<_, String>("select datetime(?, '+' || ? || ' seconds')")
+                    .bind(started)
+                    .bind(interval_seconds)
+                    .fetch_one(conn.deref_mut())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let available_by_interval = if interval_seconds == 0 || last_started.is_none() {
+            true
+        } else {
+            sqlx::query_scalar::<_, bool>(
+                "select datetime(?, '+' || ? || ' seconds') <= current_timestamp",
+            )
+            .bind(last_started.as_deref().unwrap_or_default())
+            .bind(interval_seconds)
+            .fetch_one(conn.deref_mut())
+            .await?
+        };
+        Ok((used, next_run_at, used < max_runs && available_by_interval))
+    }
+
+    pub async fn start_automation_execution(
+        &self,
+        task_id: i64,
+        device_id: &str,
+        user_name: &str,
+    ) -> ResultType<Option<i64>> {
+        let mut conn = self.pool.get().await?;
+        sqlx::query(
+            "update automation_executions set status = 'failed', completed_at = current_timestamp \
+             where task_id = ? and device_id = ? and status = 'running' \
+               and created_at < datetime(current_timestamp, '-30 minutes')",
+        )
+        .bind(task_id)
+        .bind(device_id)
+        .execute(conn.deref_mut())
+        .await?;
+        let inserted = sqlx::query(
+            "insert into automation_executions(task_id, device_id, user_name, status) \
+             select id, ?, ?, 'running' from automation_tasks \
+             where id = ? and published = 1 \
+               and (select count(*) from automation_executions e \
+                    where e.task_id = automation_tasks.id and e.device_id = ? \
+                      and e.status != 'cancelled') < max_runs \
+               and (interval_seconds = 0 or not exists ( \
+                    select 1 from automation_executions e \
+                    where e.task_id = automation_tasks.id and e.device_id = ? \
+                      and e.status != 'cancelled' \
+                      and datetime(e.created_at, '+' || automation_tasks.interval_seconds || ' seconds') \
+                          > current_timestamp))",
+        )
+        .bind(device_id)
+        .bind(user_name)
+        .bind(task_id)
+        .bind(device_id)
+        .bind(device_id)
+        .execute(conn.deref_mut())
+        .await?;
+        if inserted.rows_affected() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            sqlx::query_scalar("select last_insert_rowid()")
+                .fetch_one(conn.deref_mut())
+                .await?,
+        ))
+    }
+
+    pub async fn finish_automation_execution(
+        &self,
+        execution_id: i64,
+        device_id: &str,
+        user_name: &str,
+        status: &str,
+        result: &str,
+    ) -> ResultType<bool> {
+        let updated = sqlx::query(
+            "update automation_executions set status = ?, result = ?, \
+             completed_at = current_timestamp \
+             where id = ? and device_id = ? and user_name = ? and status = 'running'",
+        )
+        .bind(status)
+        .bind(result)
+        .bind(execution_id)
+        .bind(device_id)
+        .bind(user_name)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    pub async fn list_automation_executions(
+        &self,
+        task_id: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> ResultType<(Vec<AutomationExecution>, i64)> {
+        let mut conn = self.pool.get().await?;
+        let executions = sqlx::query_as::<_, AutomationExecution>(
+            "select id, task_id, device_id, user_name, status, result, created_at, completed_at \
+             from automation_executions where (? is null or task_id = ?) \
+             order by id desc limit ? offset ?",
+        )
+        .bind(task_id)
+        .bind(task_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(conn.deref_mut())
+        .await?;
+        let total = sqlx::query_scalar(
+            "select count(*) from automation_executions where (? is null or task_id = ?)",
+        )
+        .bind(task_id)
+        .bind(task_id)
+        .fetch_one(conn.deref_mut())
+        .await?;
+        Ok((executions, total))
     }
 
     pub async fn get_or_create_api_secret(&self) -> ResultType<String> {
