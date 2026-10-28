@@ -133,7 +133,7 @@ struct AutomationTaskRequest {
     name: String,
     #[serde(default)]
     description: String,
-    script: Value,
+    script: String,
     #[serde(default)]
     published: bool,
     #[serde(default)]
@@ -2090,73 +2090,162 @@ fn validate_automation_task(request: &AutomationTaskRequest) -> Result<String, A
         ));
     }
 
-    let steps = request
-        .script
-        .as_object()
-        .filter(|script| script.len() == 2 && script.get("version") == Some(&json!(1)))
-        .and_then(|script| script.get("steps"))
-        .and_then(Value::as_array)
-        .filter(|steps| !steps.is_empty() && steps.len() <= 50)
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "Script must be version 1 with 1 to 50 steps",
-            )
-        })?;
+    validate_automation_script(&request.script)?;
+    Ok(request.script.clone())
+}
 
-    for step in steps {
-        let Some(step) = step.as_object() else {
-            return Err(ApiError::new(StatusCode::BAD_REQUEST, "Invalid task step"));
+fn validate_automation_script(script: &str) -> Result<(), ApiError> {
+    let bad_script = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid restricted Python task script",
+        )
+    };
+    if script.trim().is_empty() || script.len() > 32_768 {
+        return Err(bad_script());
+    }
+
+    let mut statement_count = 0;
+    for line in script.lines().map(str::trim_end) {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if line.trim_start() != line {
+            return Err(bad_script());
+        }
+        let Some(open) = line.find('(') else {
+            return Err(bad_script());
         };
-        let Some(action) = step.get("action").and_then(Value::as_str) else {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "Task step action required",
-            ));
+        if !line.ends_with(')') {
+            return Err(bad_script());
+        }
+        let function = line[..open].trim();
+        let Some(arguments) = split_python_arguments(&line[open + 1..line.len() - 1]) else {
+            return Err(bad_script());
         };
-        let valid = match action {
+        let valid = match function {
             "wait" => {
-                step.len() == 2
-                    && step
-                        .get("milliseconds")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|value| (1..=30_000).contains(&value))
+                arguments.len() == 1
+                    && arguments[0].bytes().all(|digit| digit.is_ascii_digit())
+                    && !arguments[0].starts_with('0')
+                    && arguments[0]
+                        .parse::<u64>()
+                        .is_ok_and(|value| (1..=30_000).contains(&value))
             }
             "ocr_find" | "click_text" => {
-                step.len() == 2
-                    && step
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| !text.trim().is_empty() && text.len() <= 200)
+                arguments.len() == 1
+                    && serde_json::from_str::<String>(arguments[0])
+                        .is_ok_and(|text| !text.trim().is_empty() && text.chars().count() <= 200)
             }
             "click" => {
-                step.len() == 3
-                    && ["x", "y"].iter().all(|coordinate| {
-                        step.get(*coordinate)
-                            .and_then(Value::as_f64)
-                            .is_some_and(|value| (0.0..=1.0).contains(&value))
+                arguments.len() == 2
+                    && arguments.iter().all(|argument| {
+                        !argument.starts_with('-')
+                            && serde_json::from_str::<f64>(argument)
+                                .is_ok_and(|value| (0.0..=1.0).contains(&value))
                     })
             }
             _ => false,
         };
         if !valid {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "Unsupported or invalid task step",
-            ));
+            return Err(bad_script());
+        }
+        statement_count += 1;
+        if statement_count > 50 {
+            return Err(bad_script());
         }
     }
-    let encoded = serde_json::to_string(&request.script).map_err(|error| {
-        log::error!("Failed to serialize automation script: {}", error);
-        ApiError::internal()
-    })?;
-    if encoded.len() > 32_768 {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "Task script exceeds 32 KB",
-        ));
+    if statement_count == 0 {
+        return Err(bad_script());
     }
-    Ok(encoded)
+    Ok(())
+}
+
+fn split_python_arguments(source: &str) -> Option<Vec<&str>> {
+    if source.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let mut arguments = Vec::new();
+    let mut start = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in source.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+        } else {
+            match character {
+                '"' => in_string = true,
+                ',' => {
+                    let argument = source[start..index].trim();
+                    if argument.is_empty() {
+                        return None;
+                    }
+                    arguments.push(argument);
+                    start = index + character.len_utf8();
+                }
+                '(' | ')' | '\'' => return None,
+                _ => {}
+            }
+        }
+    }
+    if in_string || escaped {
+        return None;
+    }
+    let argument = source[start..].trim();
+    if argument.is_empty() {
+        return None;
+    }
+    arguments.push(argument);
+    Some(arguments)
+}
+
+fn automation_task_script_source(stored: &str) -> String {
+    let Some(source) = legacy_automation_script_source(stored) else {
+        return stored.to_owned();
+    };
+    if validate_automation_script(&source).is_ok() {
+        source
+    } else {
+        stored.to_owned()
+    }
+}
+
+fn legacy_automation_script_source(stored: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(stored).ok()?;
+    let script = value.as_object()?;
+    if script.len() != 2 || script.get("version") != Some(&json!(1)) {
+        return None;
+    }
+    let steps = script.get("steps")?.as_array()?;
+    let mut lines = Vec::with_capacity(steps.len());
+    for step in steps {
+        let step = step.as_object()?;
+        match step.get("action")?.as_str()? {
+            "wait" if step.len() == 2 => {
+                let milliseconds = step.get("milliseconds")?.as_u64()?;
+                lines.push(format!("wait({milliseconds})"));
+            }
+            action @ ("ocr_find" | "click_text") if step.len() == 2 => {
+                let text = step.get("text")?.as_str()?;
+                let text = serde_json::to_string(text).ok()?;
+                lines.push(format!("{action}({text})"));
+            }
+            "click" if step.len() == 3 => {
+                let x = step.get("x")?.as_f64()?;
+                let y = step.get("y")?.as_f64()?;
+                lines.push(format!("click({x}, {y})"));
+            }
+            _ => return None,
+        }
+    }
+    Some(lines.join("\n"))
 }
 
 async fn list_admin_automation_tasks(
@@ -2172,7 +2261,23 @@ async fn list_admin_automation_tasks(
             log::error!("Failed to list automation tasks: {}", error);
             ApiError::internal()
         })?;
-    Ok(Json(json!({ "data": tasks })))
+    let data = tasks
+        .into_iter()
+        .map(|task| {
+            json!({
+                "id": task.id,
+                "name": task.name,
+                "description": task.description,
+                "script": automation_task_script_source(&task.script),
+                "published": task.published,
+                "interval_seconds": task.interval_seconds,
+                "max_runs": task.max_runs,
+                "created_by": task.created_by,
+                "created_at": task.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "data": data })))
 }
 
 async fn create_automation_task(
@@ -2377,7 +2482,7 @@ async fn list_available_automation_tasks(
             "id": task.id,
             "name": task.name,
             "description": task.description,
-            "script": serde_json::from_str::<Value>(&task.script).unwrap_or(Value::Null),
+            "script": automation_task_script_source(&task.script),
             "intervalSeconds": task.interval_seconds,
             "maxRuns": task.max_runs,
             "usedRuns": used_runs,
@@ -3633,29 +3738,41 @@ mod tests {
         let valid = AutomationTaskRequest {
             name: "Text task".to_owned(),
             description: String::new(),
-            script: json!({
-                "version": 1,
-                "steps": [
-                    {"action": "ocr_find", "text": "Continue"},
-                    {"action": "click_text", "text": "Continue"},
-                    {"action": "click", "x": 0.5, "y": 0.4},
-                    {"action": "wait", "milliseconds": 200}
-                ]
-            }),
+            script: "ocr_find(\"Continue\")\nclick_text(\"Continue\")\nclick(0.5, 0.4)\nwait(200)"
+                .to_owned(),
             published: true,
             interval_seconds: 60,
             max_runs: 3,
         };
         assert!(validate_automation_task(&valid).is_ok());
 
-        let shell = AutomationTaskRequest {
-            script: json!({
-                "version": 1,
-                "steps": [{"action": "shell", "command": "id"}]
-            }),
-            ..valid
-        };
-        assert!(validate_automation_task(&shell).is_err());
+        for script in [
+            "import os",
+            "open(\"/tmp/file\")",
+            "__import__(\"os\")",
+            "wait(1 + 1)",
+            "click(2, 0.5)",
+            "click(-0, 0)",
+            "wait(01)",
+            "wait(+1)",
+            "wait(True)",
+            "wait(1); open(\"/tmp/file\")",
+        ] {
+            assert!(
+                validate_automation_script(script).is_err(),
+                "accepted invalid script: {script}"
+            );
+        }
+        assert!(validate_automation_script(&"wait(1)\n".repeat(51)).is_err());
+    }
+
+    #[test]
+    fn converts_preexisting_json_task_steps_to_python_source() {
+        let stored = r#"{"version":1,"steps":[{"action":"ocr_find","text":"确定"},{"action":"click","x":0.5,"y":0.4},{"action":"wait","milliseconds":500}]}"#;
+        assert_eq!(
+            automation_task_script_source(stored),
+            "ocr_find(\"确定\")\nclick(0.5, 0.4)\nwait(500)"
+        );
     }
 
     #[test]
