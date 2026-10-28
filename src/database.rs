@@ -2068,7 +2068,7 @@ impl Database {
         .bind(device_id)
         .fetch_one(conn.deref_mut())
         .await?;
-        let last_started = sqlx::query_scalar(
+        let last_started = sqlx::query_scalar::<_, Option<String>>(
             "select max(created_at) from automation_executions \
              where task_id = ? and device_id = ? and status != 'cancelled'",
         )
@@ -2217,6 +2217,73 @@ impl Database {
 mod tests {
     use super::{Connection, Database, SqliteConnectOptions, SqliteConnection};
     use hbb_common::tokio;
+
+    #[test]
+    fn automation_task_runs_enforce_limits_and_record_outcomes() {
+        automation_task_run_limits();
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    async fn automation_task_run_limits() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(file.path().to_str().unwrap()).await.unwrap();
+        let task_id = db
+            .create_automation_task(
+                "Test task",
+                "",
+                r#"{"version":1,"steps":[{"action":"wait","milliseconds":1}]}"#,
+                60,
+                2,
+                "admin",
+            )
+            .await
+            .unwrap();
+        assert!(db
+            .update_automation_task(
+                task_id,
+                "Test task",
+                "",
+                r#"{"version":1,"steps":[{"action":"wait","milliseconds":1}]}"#,
+                true,
+                60,
+                2,
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            db.automation_task_usage(task_id, "device", 2, 60)
+                .await
+                .unwrap(),
+            (0, None, true)
+        );
+
+        let execution_id = db
+            .start_automation_execution(task_id, "device", "user")
+            .await
+            .unwrap()
+            .unwrap();
+        let (used, next_run_at, can_run) = db
+            .automation_task_usage(task_id, "device", 2, 60)
+            .await
+            .unwrap();
+        assert_eq!(used, 1);
+        assert!(next_run_at.is_some());
+        assert!(!can_run);
+        assert!(db
+            .start_automation_execution(task_id, "device", "user")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .finish_automation_execution(execution_id, "device", "user", "succeeded", "done")
+            .await
+            .unwrap());
+
+        let (executions, total) = db.list_automation_executions(None, 10, 0).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(executions[0].status, "succeeded");
+        assert_eq!(executions[0].result, "done");
+    }
 
     #[test]
     fn migrates_legacy_address_books_and_allows_scoped_names() {

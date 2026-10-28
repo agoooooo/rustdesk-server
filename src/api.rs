@@ -1,8 +1,6 @@
 use crate::{
     common::{get_arg, get_arg_opt},
-    database::{
-        AddressBookPermission, AutomationTask, Database, DelegatedRole, PeerClaimResult, User,
-    },
+    database::{AddressBookPermission, Database, DelegatedRole, PeerClaimResult, User},
     peer::PeerMap,
 };
 use axum::{
@@ -2437,7 +2435,7 @@ async fn finish_automation_execution(
         &state,
         &headers,
         &AutomationDeviceIdentity {
-            id: request.id,
+            id: request.id.clone(),
             uuid: request.uuid,
         },
     )
