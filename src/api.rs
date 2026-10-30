@@ -2090,131 +2090,20 @@ fn validate_automation_task(request: &AutomationTaskRequest) -> Result<String, A
         ));
     }
 
-    validate_automation_script(&request.script)?;
-    Ok(request.script.clone())
-}
-
-fn validate_automation_script(script: &str) -> Result<(), ApiError> {
-    let bad_script = || {
-        ApiError::new(
+    if request.script.trim().is_empty() {
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "Invalid restricted Python task script",
-        )
-    };
-    if script.trim().is_empty() || script.len() > 32_768 {
-        return Err(bad_script());
+            "Task script cannot be empty",
+        ));
     }
-
-    let mut statement_count = 0;
-    for line in script.lines().map(str::trim_end) {
-        let line = line.trim_end_matches('\r');
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
-            continue;
-        }
-        if line.trim_start() != line {
-            return Err(bad_script());
-        }
-        let Some(open) = line.find('(') else {
-            return Err(bad_script());
-        };
-        if !line.ends_with(')') {
-            return Err(bad_script());
-        }
-        let function = line[..open].trim();
-        let Some(arguments) = split_python_arguments(&line[open + 1..line.len() - 1]) else {
-            return Err(bad_script());
-        };
-        let valid = match function {
-            "wait" => {
-                arguments.len() == 1
-                    && arguments[0].bytes().all(|digit| digit.is_ascii_digit())
-                    && !arguments[0].starts_with('0')
-                    && arguments[0]
-                        .parse::<u64>()
-                        .is_ok_and(|value| (1..=30_000).contains(&value))
-            }
-            "ocr_find" | "click_text" => {
-                arguments.len() == 1
-                    && serde_json::from_str::<String>(arguments[0])
-                        .is_ok_and(|text| !text.trim().is_empty() && text.chars().count() <= 200)
-            }
-            "click" => {
-                arguments.len() == 2
-                    && arguments.iter().all(|argument| {
-                        !argument.starts_with('-')
-                            && serde_json::from_str::<f64>(argument)
-                                .is_ok_and(|value| (0.0..=1.0).contains(&value))
-                    })
-            }
-            _ => false,
-        };
-        if !valid {
-            return Err(bad_script());
-        }
-        statement_count += 1;
-        if statement_count > 50 {
-            return Err(bad_script());
-        }
-    }
-    if statement_count == 0 {
-        return Err(bad_script());
-    }
-    Ok(())
-}
-
-fn split_python_arguments(source: &str) -> Option<Vec<&str>> {
-    if source.trim().is_empty() {
-        return Some(Vec::new());
-    }
-    let mut arguments = Vec::new();
-    let mut start = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, character) in source.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-        } else {
-            match character {
-                '"' => in_string = true,
-                ',' => {
-                    let argument = source[start..index].trim();
-                    if argument.is_empty() {
-                        return None;
-                    }
-                    arguments.push(argument);
-                    start = index + character.len_utf8();
-                }
-                '(' | ')' | '\'' => return None,
-                _ => {}
-            }
-        }
-    }
-    if in_string || escaped {
-        return None;
-    }
-    let argument = source[start..].trim();
-    if argument.is_empty() {
-        return None;
-    }
-    arguments.push(argument);
-    Some(arguments)
+    Ok(request.script.clone())
 }
 
 fn automation_task_script_source(stored: &str) -> String {
     let Some(source) = legacy_automation_script_source(stored) else {
         return stored.to_owned();
     };
-    if validate_automation_script(&source).is_ok() {
-        source
-    } else {
-        stored.to_owned()
-    }
+    source
 }
 
 fn legacy_automation_script_source(stored: &str) -> Option<String> {
@@ -3734,36 +3623,25 @@ mod tests {
     }
 
     #[test]
-    fn automation_scripts_allow_only_bounded_mobile_actions() {
-        let valid = AutomationTaskRequest {
+    fn automation_scripts_accept_full_python_source() {
+        let task = |script| AutomationTaskRequest {
             name: "Text task".to_owned(),
             description: String::new(),
-            script: "ocr_find(\"Continue\")\nclick_text(\"Continue\")\nclick(0.5, 0.4)\nwait(200)"
-                .to_owned(),
+            script,
             published: true,
             interval_seconds: 60,
             max_runs: 3,
         };
-        assert!(validate_automation_task(&valid).is_ok());
-
-        for script in [
-            "import os",
-            "open(\"/tmp/file\")",
-            "__import__(\"os\")",
-            "wait(1 + 1)",
-            "click(2, 0.5)",
-            "click(-0, 0)",
-            "wait(01)",
-            "wait(+1)",
-            "wait(True)",
-            "wait(1); open(\"/tmp/file\")",
-        ] {
-            assert!(
-                validate_automation_script(script).is_err(),
-                "accepted invalid script: {script}"
-            );
-        }
-        assert!(validate_automation_script(&"wait(1)\n".repeat(51)).is_err());
+        assert!(validate_automation_task(&task(
+            "import os\nvalue = 2\nfor _ in range(value):\n    wait(200)\nresult = os.getcwd()"
+                .to_owned(),
+        ))
+        .is_ok());
+        assert!(
+            validate_automation_task(&task(format!("{}\nresult = True", "#".repeat(32_768))))
+                .is_ok()
+        );
+        assert!(validate_automation_task(&task(" \n".to_owned())).is_err());
     }
 
     #[test]
